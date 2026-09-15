@@ -9,6 +9,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <!-- ONNX Runtime Web — required for Silero VAD inference -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.min.js"></script>
     <link
         href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap"
         rel="stylesheet">
@@ -1064,12 +1066,27 @@
         (function () {
             'use strict';
 
+            // PERF: global page-visibility flag to pause RAF loops when tab is hidden
+            let isPageVisible = !document.hidden;
+            document.addEventListener('visibilitychange', function () {
+                isPageVisible = !document.hidden;
+            });
+            // Expose globally so other script blocks can read it
+            Object.defineProperty(window, 'isPageVisible', { get() { return isPageVisible; } });
+
             const TrueToneAudio = {
                 stream: null,
                 audioCtx: null,
                 sourceNode: null,
+                // PERF: shared analyser node created once, used by both orb and graphs modules
+                sharedAnalyser: null,
                 state: 'idle', // 'idle' | 'requesting' | 'active' | 'denied' | 'error'
                 errorMessage: null,
+                // Actual audio parameters (populated after stream connection)
+                actualSampleRate: null,
+                actualChannelCount: null,
+                // AudioWorklet chunking node (created in startAnalysis)
+                chunkWorkletNode: null,
                 _subscribers: [],
 
                 onActive(callback) {
@@ -1116,9 +1133,15 @@
                     }
 
                     // Create/unlock AudioContext synchronously during click gesture
+                    // Request 16kHz sample rate if the browser supports it
                     if (!this.audioCtx || this.audioCtx.state === 'closed') {
                         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-                        this.audioCtx = new AudioContextClass();
+                        try {
+                            this.audioCtx = new AudioContextClass({ sampleRate: 16000 });
+                        } catch (ctxErr) {
+                            console.warn('TrueTone: AudioContext rejected sampleRate: 16000, falling back to default rate. Downstream resampling will be needed.', ctxErr);
+                            this.audioCtx = new AudioContextClass();
+                        }
                     }
                     if (this.audioCtx.state === 'suspended') {
                         this.audioCtx.resume().catch(() => {});
@@ -1149,14 +1172,16 @@
                     }
 
                     try {
-                        // Single centralized getUserMedia call
+                        // Single centralized getUserMedia call — request mono 16kHz
                         let stream;
                         try {
                             stream = await navigator.mediaDevices.getUserMedia({
                                 audio: {
                                     echoCancellation: true,
                                     noiseSuppression: false,
-                                    autoGainControl: false
+                                    autoGainControl: false,
+                                    channelCount: 1,
+                                    sampleRate: 16000
                                 }
                             });
                         } catch (constraintErr) {
@@ -1169,7 +1194,12 @@
                         // Ensure AudioContext exists and connect stream
                         if (!this.audioCtx || this.audioCtx.state === 'closed') {
                             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-                            this.audioCtx = new AudioContextClass();
+                            try {
+                                this.audioCtx = new AudioContextClass({ sampleRate: 16000 });
+                            } catch (ctxErr) {
+                                console.warn('TrueTone: AudioContext rejected sampleRate: 16000, falling back to default rate. Downstream resampling will be needed.', ctxErr);
+                                this.audioCtx = new AudioContextClass();
+                            }
                         }
                         this.audioCtx.resume().catch(() => {});
 
@@ -1179,8 +1209,50 @@
                             console.warn('TrueToneAudio: sourceNode creation error:', srcErr);
                         }
 
+                        // --- Detect actual sample rate and channel count ---
+                        this.actualSampleRate = this.audioCtx.sampleRate;
+
+                        const audioTracks = stream.getAudioTracks();
+                        if (audioTracks.length > 0) {
+                            const settings = audioTracks[0].getSettings();
+                            this.actualChannelCount = settings.channelCount || null;
+                        } else {
+                            this.actualChannelCount = null;
+                        }
+
+                        console.info(
+                            `TrueTone Audio Pipeline:\n` +
+                            `  Requested : sampleRate=16000, channelCount=1\n` +
+                            `  Actual    : sampleRate=${this.actualSampleRate}, channelCount=${this.actualChannelCount}`
+                        );
+
+                        if (this.actualSampleRate !== 16000) {
+                            console.warn(
+                                `TrueTone: AudioContext is running at ${this.actualSampleRate} Hz instead of the requested 16000 Hz. ` +
+                                `Downstream resampling will be needed before passing audio to any 16 kHz model.`
+                            );
+                        }
+                        if (this.actualChannelCount !== null && this.actualChannelCount !== 1) {
+                            console.warn(
+                                `TrueTone: Microphone is providing ${this.actualChannelCount} channel(s) instead of the requested 1 (mono). ` +
+                                `Downstream channel mixing may be needed.`
+                            );
+                        }
+                        // --- End detection ---
+
                         this.state = 'active';
                         this.errorMessage = null;
+
+                        // PERF: create a single shared AnalyserNode for both orb and graphs modules
+                        if (this.sourceNode && !this.sharedAnalyser) {
+                            this.sharedAnalyser = this.audioCtx.createAnalyser();
+                            this.sharedAnalyser.fftSize = 2048;
+                            this.sharedAnalyser.smoothingTimeConstant = 0.5;
+                            this.sourceNode.connect(this.sharedAnalyser);
+                        }
+
+                        // --- AudioWorklet: load chunk processor and connect ---
+                        await this._initChunkWorklet();
 
                         // Set global application state
                         window.TrueToneState = window.TrueToneState || {};
@@ -1226,6 +1298,92 @@
 
                         handleAudioError(userFriendlyMsg, startBtn, startBtnText, micErrorMsg, micErrorText, micStatusIndicator);
                         return false;
+                    }
+                },
+
+                /**
+                 * Load the audio-chunk-processor worklet module and connect
+                 * a worklet node into the graph (parallel to sharedAnalyser).
+                 * Safe to call multiple times — idempotent.
+                 */
+                async _initChunkWorklet(chunkDurationMs = 250) {
+                    // Guard: already initialised
+                    if (this.chunkWorkletNode) return;
+
+                    // Guard: secure context required for AudioWorklet
+                    if (!window.isSecureContext) {
+                        console.error(
+                            'TrueTone ChunkWorklet: AudioWorklet requires a secure context (HTTPS or localhost). ' +
+                            'Chunk capture is disabled.'
+                        );
+                        return;
+                    }
+
+                    // Guard: browser must support AudioWorklet
+                    if (!this.audioCtx || typeof this.audioCtx.audioWorklet === 'undefined') {
+                        console.error(
+                            'TrueTone ChunkWorklet: This browser does not support AudioWorklet. ' +
+                            'Chunk capture is disabled. Consider using ScriptProcessorNode as a fallback.'
+                        );
+                        return;
+                    }
+
+                    // Guard: need a live source node
+                    if (!this.sourceNode) {
+                        console.warn('TrueTone ChunkWorklet: sourceNode is not available — skipping worklet init.');
+                        return;
+                    }
+
+                    try {
+                        // 1. Load the module (must resolve before creating the node)
+                        await this.audioCtx.audioWorklet.addModule('audio-chunk-processor.js');
+
+                        // 2. Create the worklet node with chunk-duration config
+                        this.chunkWorkletNode = new AudioWorkletNode(
+                            this.audioCtx,
+                            'audio-chunk-processor',
+                            {
+                                // Single mono input, no output needed
+                                numberOfInputs: 1,
+                                numberOfOutputs: 0,
+                                channelCount: 1,
+                                channelCountMode: 'explicit',
+                                channelInterpretation: 'speakers',
+                                processorOptions: {
+                                    chunkDurationMs: chunkDurationMs
+                                }
+                            }
+                        );
+
+                        // 3. Connect from sourceNode as a parallel branch
+                        //    (does NOT disconnect or duplicate the existing sharedAnalyser connection)
+                        this.sourceNode.connect(this.chunkWorkletNode);
+
+                        // 4. Listen for chunks on the main thread
+                        this.chunkWorkletNode.port.onmessage = (event) => {
+                            const msg = event.data;
+                            if (msg && msg.type === 'audio-chunk') {
+                                // Dispatch a custom event so any consumer can subscribe
+                                window.dispatchEvent(new CustomEvent('truetone-audio-chunk', {
+                                    detail: {
+                                        samples: msg.samples,
+                                        sampleCount: msg.sampleCount,
+                                        sampleRate: msg.sampleRate,
+                                        captureTime: msg.captureTime
+                                    }
+                                }));
+                            }
+                        };
+
+                        console.info(
+                            `TrueTone ChunkWorklet: Connected successfully. ` +
+                            `chunkDuration=${chunkDurationMs}ms, ` +
+                            `chunkSize=${Math.round((chunkDurationMs / 1000) * this.actualSampleRate)} samples`
+                        );
+
+                    } catch (workletErr) {
+                        console.error('TrueTone ChunkWorklet: Failed to load or connect audio worklet:', workletErr);
+                        this.chunkWorkletNode = null;
                     }
                 }
             };
@@ -1280,7 +1438,465 @@
             window.TrueToneAudio = TrueToneAudio;
             window.navigateToDashboard = navigateToDashboard;
 
-            // Check if permission was already granted previously
+            // ===================================================================
+            // TrueToneChunkManager — wraps raw audio chunks with metadata
+            // and maintains an in-memory queue for downstream consumers.
+            // ===================================================================
+            const TrueToneChunkManager = {
+                /** @type {Array<Object>} In-memory queue of chunk-metadata objects */
+                _queue: [],
+
+                /** Auto-incrementing counter for unique chunk IDs */
+                _nextId: 0,
+
+                /** Whether the manager is actively listening */
+                _listening: false,
+
+                /**
+                 * Start listening for 'truetone-audio-chunk' events.
+                 * Safe to call multiple times — idempotent.
+                 */
+                start() {
+                    if (this._listening) return;
+                    window.addEventListener('truetone-audio-chunk', this._handleChunk);
+                    this._listening = true;
+                    console.info('TrueToneChunkManager: Started listening for audio chunks.');
+                },
+
+                /**
+                 * Stop listening (e.g. on session end). Does NOT drain the queue.
+                 */
+                stop() {
+                    if (!this._listening) return;
+                    window.removeEventListener('truetone-audio-chunk', this._handleChunk);
+                    this._listening = false;
+                    console.info('TrueToneChunkManager: Stopped listening.');
+                },
+
+                /**
+                 * Core handler — bound as an arrow-property so `this` is stable.
+                 * Wraps each raw chunk with metadata and pushes to the queue.
+                 */
+                _handleChunk: null, // assigned below (needs arrow fn for stable `this`)
+
+                /**
+                 * Drain the queue: returns all queued chunk objects and clears the queue.
+                 * @returns {Array<Object>} Array of chunk-metadata objects
+                 */
+                drain() {
+                    const chunks = this._queue;
+                    this._queue = [];
+                    return chunks;
+                },
+
+                /**
+                 * Peek at the queue without draining.
+                 * @returns {Array<Object>} Current queue contents (reference — do not mutate)
+                 */
+                peek() {
+                    return this._queue;
+                },
+
+                /**
+                 * Clear the queue, discarding all chunks.
+                 */
+                clear() {
+                    this._queue = [];
+                },
+
+                /**
+                 * Number of chunks currently queued.
+                 * @returns {number}
+                 */
+                get length() {
+                    return this._queue.length;
+                }
+            };
+
+            // Assign the handler as an arrow function to capture stable `this`
+            TrueToneChunkManager._handleChunk = (event) => {
+                const detail = event.detail;
+                if (!detail) return;
+
+                const audio = window.TrueToneAudio;
+                const sampleRate = (audio && audio.actualSampleRate) || detail.sampleRate;
+                const channelCount = (audio && audio.actualChannelCount) || 1;
+                const sampleCount = detail.sampleCount;
+
+                // Compute chunk duration from actual values
+                const chunkDurationMs = sampleRate > 0
+                    ? (sampleCount / sampleRate) * 1000
+                    : 0;
+
+                // captureTime comes from the worklet's AudioContext.currentTime (audio clock).
+                // If the worklet didn't provide it, fall back to wall-clock receipt time.
+                const hasCaptureTime = typeof detail.captureTime === 'number';
+                const captureTimeSec = hasCaptureTime ? detail.captureTime : null;
+                const receiptTimestamp = performance.now();
+
+                const chunkMeta = {
+                    /** Unique monotonic chunk ID for this session */
+                    chunkId: TrueToneChunkManager._nextId++,
+
+                    /** Audio-clock capture time in seconds (from AudioWorkletGlobalScope.currentTime) */
+                    captureTimeSec: captureTimeSec,
+
+                    /** Wall-clock receipt time via performance.now() (ms since page load) */
+                    receiptTimeMs: receiptTimestamp,
+
+                    /** ISO timestamp for human readability */
+                    receiptTimestampISO: new Date().toISOString(),
+
+                    /**
+                     * True if captureTimeSec is from the audio clock;
+                     * false if we fell back to receipt time.
+                     */
+                    captureTimeIsAudioClock: hasCaptureTime,
+
+                    /** Number of PCM samples in this chunk */
+                    sampleCount: sampleCount,
+
+                    /** Actual sample rate of the AudioContext (Hz) */
+                    sampleRate: sampleRate,
+
+                    /** Actual channel count from the microphone track */
+                    channelCount: channelCount,
+
+                    /** Computed chunk duration in milliseconds */
+                    chunkDurationMs: Math.round(chunkDurationMs * 1000) / 1000, // 3 decimal places
+
+                    /** Raw PCM sample data (Float32Array) */
+                    samples: detail.samples,
+
+                    /** Will be set by VAD: true = speech, false = silence, null = pending */
+                    isSpeech: null
+                };
+
+                // Route through Silero VAD — speech chunks get queued, silence is dropped
+                if (window.TrueToneSileroVAD) {
+                    window.TrueToneSileroVAD.classifyChunk(chunkMeta);
+                } else {
+                    // VAD not available — queue as-is with isSpeech: null
+                    TrueToneChunkManager._queue.push(chunkMeta);
+                }
+            };
+
+            // Auto-start when audio pipeline becomes active
+            TrueToneAudio.onActive(() => {
+                TrueToneChunkManager.start();
+            });
+
+            // Expose globally
+            window.TrueToneChunkManager = TrueToneChunkManager;
+
+            // ===================================================================
+            // TrueToneSileroVAD — Silero VAD v5 integration via onnxruntime-web
+            //
+            // Silero VAD v5 ONNX model specification (verified from official repo
+            // and community documentation):
+            //
+            //   Input tensors:
+            //     "input"  : Float32  [1, 576]     — 512 new samples + 64 rolling context
+            //     "state"  : Float32  [2, 1, 128]  — LSTM hidden + cell state
+            //     "sr"     : Int64    [1]           — sample rate (16000n)
+            //
+            //   Output tensors:
+            //     "output" : Float32  [1, 1]        — speech probability [0..1]
+            //     "stateN" : Float32  [2, 1, 128]   — updated LSTM state
+            //
+            //   Frame size: 512 new samples at 16kHz (32ms per frame)
+            //   The 576-sample input = 64-sample tail from previous frame + 512 new
+            //   For the very first frame, the 64-sample tail is zero-filled.
+            //
+            //   TODO: Verify these tensor names against the actual .onnx file being
+            //   used by logging session.inputNames and session.outputNames at load
+            //   time. The names above are from Silero VAD v5 — older or custom
+            //   exports may differ.
+            // ===================================================================
+            const TrueToneSileroVAD = {
+                /** @type {ort.InferenceSession|null} */
+                _session: null,
+
+                /** Model loading state: 'idle' | 'loading' | 'ready' | 'failed' */
+                _modelState: 'idle',
+
+                /** Error message if model loading failed */
+                _loadError: null,
+
+                /** Chunks received before model was ready — will be processed once loaded */
+                _pendingChunks: [],
+
+                // --- Silero VAD v5 frame parameters ---
+                /** New audio samples per frame (512 at 16kHz = 32ms) */
+                FRAME_NEW_SAMPLES: 512,
+                /** Rolling context samples prepended to each frame */
+                FRAME_CONTEXT_SAMPLES: 64,
+                /** Total input tensor length per frame */
+                FRAME_TOTAL_SAMPLES: 576, // 512 + 64
+
+                // --- LSTM state ---
+                /** @type {Float32Array} Persistent LSTM state [2, 1, 128] = 256 floats */
+                _lstmState: new Float32Array(2 * 1 * 128),
+                /** @type {Float32Array} 64-sample rolling tail from previous frame */
+                _contextTail: new Float32Array(64),
+
+                // --- Internal sample buffer ---
+                // Incoming chunks (e.g. 4000 samples at 250ms/16kHz) are much larger
+                // than the 512-sample frame Silero expects. We buffer incoming samples
+                // and slice them into 512-sample frames for inference.
+                /** @type {Float32Array[]} Queued sample arrays awaiting framing */
+                _sampleBuffer: [],
+                /** Total samples currently buffered */
+                _bufferedSampleCount: 0,
+
+                // --- Configuration ---
+                /** Speech probability threshold — chunks above this are classified as speech */
+                speechThreshold: 0.5,
+
+                /** URL to the Silero VAD v5 ONNX model file */
+                modelUrl: 'https://huggingface.co/runanywhere/silero-vad-v5/resolve/main/silero_vad.onnx',
+
+                /**
+                 * Load the Silero VAD ONNX model. Safe to call multiple times.
+                 */
+                async loadModel() {
+                    if (this._modelState === 'ready' || this._modelState === 'loading') return;
+
+                    // Check that onnxruntime-web is available
+                    if (typeof ort === 'undefined') {
+                        this._modelState = 'failed';
+                        this._loadError = 'onnxruntime-web (ort) is not loaded. Ensure the CDN script is included before this module.';
+                        console.error('TrueToneSileroVAD:', this._loadError);
+                        return;
+                    }
+
+                    this._modelState = 'loading';
+                    console.info('TrueToneSileroVAD: Loading Silero VAD v5 ONNX model...');
+
+                    try {
+                        // Configure WASM paths for onnxruntime-web
+                        ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/';
+
+                        this._session = await ort.InferenceSession.create(this.modelUrl, {
+                            executionProviders: ['wasm']
+                        });
+
+                        // Log actual tensor names for verification
+                        console.info('TrueToneSileroVAD: Model loaded successfully.');
+                        console.info('  inputNames:', this._session.inputNames);
+                        console.info('  outputNames:', this._session.outputNames);
+
+                        this._modelState = 'ready';
+
+                        // Process any chunks that arrived while model was loading
+                        if (this._pendingChunks.length > 0) {
+                            console.info(`TrueToneSileroVAD: Processing ${this._pendingChunks.length} queued chunk(s).`);
+                            const pending = this._pendingChunks;
+                            this._pendingChunks = [];
+                            for (const chunk of pending) {
+                                await this._processChunk(chunk);
+                            }
+                        }
+
+                    } catch (err) {
+                        this._modelState = 'failed';
+                        this._loadError = err.message || String(err);
+                        console.error('TrueToneSileroVAD: Failed to load ONNX model:', err);
+                        console.warn('TrueToneSileroVAD: VAD classification will be unavailable. Chunks will pass through unfiltered.');
+
+                        // Flush pending chunks to the queue unfiltered
+                        if (this._pendingChunks.length > 0) {
+                            const pending = this._pendingChunks;
+                            this._pendingChunks = [];
+                            for (const chunk of pending) {
+                                window.TrueToneChunkManager._queue.push(chunk);
+                            }
+                        }
+                    }
+                },
+
+                /**
+                 * Entry point called by TrueToneChunkManager for each incoming chunk.
+                 * If model isn't ready yet, queues the chunk; otherwise processes immediately.
+                 */
+                classifyChunk(chunkMeta) {
+                    if (this._modelState === 'loading' || this._modelState === 'idle') {
+                        // Model still loading — queue chunk, don't drop it
+                        this._pendingChunks.push(chunkMeta);
+                        return;
+                    }
+
+                    if (this._modelState === 'failed') {
+                        // Model failed to load — pass through unfiltered
+                        chunkMeta.isSpeech = null; // indicate VAD unavailable
+                        window.TrueToneChunkManager._queue.push(chunkMeta);
+                        return;
+                    }
+
+                    // Model is ready — process asynchronously
+                    this._processChunk(chunkMeta);
+                },
+
+                /**
+                 * Internal: process a single chunk by slicing it into 512-sample frames,
+                 * running inference on each, and deciding speech/silence for the whole chunk.
+                 */
+                async _processChunk(chunkMeta) {
+                    try {
+                        const samples = chunkMeta.samples;
+                        if (!samples || samples.length === 0) {
+                            chunkMeta.isSpeech = false;
+                            return; // drop empty chunk
+                        }
+
+                        // Buffer incoming samples
+                        this._sampleBuffer.push(samples);
+                        this._bufferedSampleCount += samples.length;
+
+                        // We need at least FRAME_NEW_SAMPLES (512) to run one frame
+                        if (this._bufferedSampleCount < this.FRAME_NEW_SAMPLES) {
+                            // Not enough samples yet — hold the chunk metadata, it will
+                            // be attributed to the next complete set of frames
+                            return;
+                        }
+
+                        // Flatten buffered samples into a single contiguous array
+                        const allSamples = this._flattenBuffer();
+
+                        // Slice into 512-sample frames and run inference on each
+                        let frameOffset = 0;
+                        let maxProb = 0;
+                        let frameCount = 0;
+
+                        while (frameOffset + this.FRAME_NEW_SAMPLES <= allSamples.length) {
+                            const frameSamples = allSamples.subarray(
+                                frameOffset,
+                                frameOffset + this.FRAME_NEW_SAMPLES
+                            );
+
+                            const prob = await this._runFrame(frameSamples);
+                            if (prob > maxProb) maxProb = prob;
+                            frameCount++;
+
+                            frameOffset += this.FRAME_NEW_SAMPLES;
+                        }
+
+                        // Keep leftover samples (less than 512) in the buffer
+                        if (frameOffset < allSamples.length) {
+                            this._sampleBuffer = [allSamples.subarray(frameOffset)];
+                            this._bufferedSampleCount = allSamples.length - frameOffset;
+                        } else {
+                            this._sampleBuffer = [];
+                            this._bufferedSampleCount = 0;
+                        }
+
+                        // Classify: use max probability across all frames in this chunk
+                        const isSpeech = maxProb >= this.speechThreshold;
+                        chunkMeta.isSpeech = isSpeech;
+                        chunkMeta.vadProbability = Math.round(maxProb * 10000) / 10000;
+                        chunkMeta.vadFrameCount = frameCount;
+                        chunkMeta.vadThreshold = this.speechThreshold;
+
+                        // Only queue speech chunks; silence is dropped
+                        if (isSpeech) {
+                            window.TrueToneChunkManager._queue.push(chunkMeta);
+                        }
+
+                    } catch (err) {
+                        console.error('TrueToneSileroVAD: Inference error:', err);
+                        // On error, pass chunk through unfiltered so audio isn't lost
+                        chunkMeta.isSpeech = null;
+                        chunkMeta.vadError = err.message || String(err);
+                        window.TrueToneChunkManager._queue.push(chunkMeta);
+                    }
+                },
+
+                /**
+                 * Run Silero VAD inference on a single 512-sample frame.
+                 * Handles the 64-sample rolling context and LSTM state threading.
+                 *
+                 * @param {Float32Array} newSamples — exactly 512 samples
+                 * @returns {Promise<number>} speech probability [0..1]
+                 */
+                async _runFrame(newSamples) {
+                    // Build the 576-sample input: [64 context | 512 new]
+                    const inputData = new Float32Array(this.FRAME_TOTAL_SAMPLES);
+                    inputData.set(this._contextTail, 0);
+                    inputData.set(newSamples, this.FRAME_CONTEXT_SAMPLES);
+
+                    // Prepare ONNX tensors
+                    // TODO: Verify tensor names ("input", "state", "sr") against your specific
+                    // model file by checking session.inputNames at load time. The names below
+                    // are from Silero VAD v5 (snakers4/silero-vad). Older versions or custom
+                    // exports may use different names.
+                    const inputTensor = new ort.Tensor('float32', inputData, [1, this.FRAME_TOTAL_SAMPLES]);
+                    const stateTensor = new ort.Tensor('float32', this._lstmState.slice(), [2, 1, 128]);
+                    const srTensor = new ort.Tensor('int64', new BigInt64Array([16000n]), [1]);
+
+                    const feeds = {
+                        'input': inputTensor,
+                        'state': stateTensor,
+                        'sr': srTensor
+                    };
+
+                    // TODO: Verify output tensor names ("output", "stateN") against your
+                    // specific model file by checking session.outputNames at load time.
+                    const results = await this._session.run(feeds);
+
+                    // Extract speech probability
+                    const prob = results['output'].data[0];
+
+                    // Update LSTM state for next frame
+                    const newState = results['stateN'];
+                    if (newState && newState.data) {
+                        this._lstmState.set(newState.data);
+                    }
+
+                    // Update rolling context tail (last 64 samples of the 576-sample input)
+                    this._contextTail.set(
+                        inputData.subarray(this.FRAME_TOTAL_SAMPLES - this.FRAME_CONTEXT_SAMPLES)
+                    );
+
+                    return prob;
+                },
+
+                /**
+                 * Flatten the sample buffer array into a single Float32Array.
+                 * @returns {Float32Array}
+                 */
+                _flattenBuffer() {
+                    if (this._sampleBuffer.length === 1) {
+                        return this._sampleBuffer[0];
+                    }
+                    const result = new Float32Array(this._bufferedSampleCount);
+                    let offset = 0;
+                    for (const arr of this._sampleBuffer) {
+                        result.set(arr, offset);
+                        offset += arr.length;
+                    }
+                    return result;
+                },
+
+                /**
+                 * Reset LSTM state and context tail (e.g. on new call/session).
+                 */
+                resetState() {
+                    this._lstmState.fill(0);
+                    this._contextTail.fill(0);
+                    this._sampleBuffer = [];
+                    this._bufferedSampleCount = 0;
+                    console.info('TrueToneSileroVAD: State reset.');
+                }
+            };
+
+            // Expose globally
+            window.TrueToneSileroVAD = TrueToneSileroVAD;
+
+            // Auto-load model when audio pipeline becomes active
+            TrueToneAudio.onActive(() => {
+                TrueToneSileroVAD.loadModel();
+            });
+
             if (navigator.permissions && navigator.permissions.query) {
                 navigator.permissions.query({ name: 'microphone' }).then(permissionStatus => {
                     if (permissionStatus.state === 'granted') {
@@ -1373,9 +1989,9 @@
             return Math.max(min, Math.min(max, next));
         }
 
-        // Update metrics with randomized 300-500ms interval
+        // PERF: slowed fake metric-card update from 300–500ms to 600–800ms to reduce DOM writes
         function scheduleUpdate() {
-            const delay = 300 + Math.random() * 200;
+            const delay = 600 + Math.random() * 200;
             setTimeout(() => {
                 acousticData.forEach((metric, i) => {
                     metric.value = smoothDrift(metric.value, metric.min, metric.max, metric.step);
@@ -1453,7 +2069,8 @@
                 intensity: 1.0,
                 hue: 0.0,
                 length: 0.95,
-                segments: 128,
+                // PERF: reduced orb sphere segments from 128 to 64 for lower GPU load
+                segments: 64,
                 audioSmoothing: 0.12,
                 fftSize: 2048,
                 maxPixelRatio: 2
@@ -1664,8 +2281,8 @@
             vec3 totalRibbon = vec3(0.0);
             float totalStrength = 0.0;
 
-            // Sample at 3 depth layers for volumetric appearance
-            for (int layer = 0; layer < 3; layer++) {
+            // PERF: reduced depth layers from 3 to 2 to lower fragment shader cost
+            for (int layer = 0; layer < 2; layer++) {
                 float depth = 0.65 + float(layer) * 0.17;
                 vec3 sp = p * depth;
                 float lw = 0.35 - float(layer) * 0.06;
@@ -1765,7 +2382,8 @@
                 console.warn('True Tone: WebGL not available.');
                 return;
             }
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, CONFIG.maxPixelRatio));
+            // PERF: capped devicePixelRatio to 1 to halve GPU fragment workload on HiDPI screens
+            renderer.setPixelRatio(1);
             renderer.setClearColor(0x000000, 0);
             renderer.domElement.style.display = 'block';
             renderer.domElement.style.borderRadius = '50%';
@@ -1798,8 +2416,8 @@
             var orbMesh = new THREE.Mesh(geometry, material);
             scene.add(orbMesh);
 
-            // Outer glow halo sphere
-            var glowGeometry = new THREE.SphereGeometry(1.18, 64, 64);
+            // PERF: reduced glow halo sphere segments from 64 to 32 for lower GPU load
+            var glowGeometry = new THREE.SphereGeometry(1.18, 32, 32);
             var glowMaterial = new THREE.ShaderMaterial({
                 vertexShader: GLOW_VS,
                 fragmentShader: GLOW_FS,
@@ -1834,15 +2452,19 @@
              * Connects to the centralized TrueToneAudio pipeline.
              * Binds an AnalyserNode to the shared sourceNode and receives live microphone data.
              */
+            // PERF: reuse the single shared AnalyserNode instead of creating a duplicate
             function connectSharedMicrophone(audioMgr) {
                 if (micInitialized) return;
                 try {
                     micStream = audioMgr.stream;
                     audioCtx = audioMgr.audioCtx;
-                    analyser = audioCtx.createAnalyser();
-                    analyser.fftSize = CONFIG.fftSize;
-                    analyser.smoothingTimeConstant = 0.8;
-                    audioMgr.sourceNode.connect(analyser);
+                    analyser = audioMgr.sharedAnalyser;
+                    if (!analyser) {
+                        analyser = audioCtx.createAnalyser();
+                        analyser.fftSize = CONFIG.fftSize;
+                        analyser.smoothingTimeConstant = 0.8;
+                        audioMgr.sourceNode.connect(analyser);
+                    }
                     freqData = new Uint8Array(analyser.frequencyBinCount);
                     micInitialized = true;
                     console.log('True Tone Sphere: Connected to shared microphone pipeline.');
@@ -1893,6 +2515,8 @@
              */
             (function animate() {
                 requestAnimationFrame(animate);
+                // PERF: skip rendering when tab is hidden to avoid wasted GPU work
+                if (!window.isPageVisible) return;
                 updateAudio();
                 uniforms.uTime.value = clock.getElapsedTime();
                 uniforms.uAudioLevel.value = smoothLevel;
@@ -2033,16 +2657,19 @@
              * Connects real-time acoustic graphs to the shared microphone audio pipeline.
              * Avoids duplicate getUserMedia requests.
              */
+            // PERF: reuse the single shared AnalyserNode instead of creating a duplicate
             function connectSharedMicrophone(audioMgr) {
                 if (isAudioActive) return;
                 try {
                     micStream = audioMgr.stream;
                     audioCtx = audioMgr.audioCtx;
-                    analyser = audioCtx.createAnalyser();
-                    analyser.fftSize = 2048;
-                    analyser.smoothingTimeConstant = 0.3;
-
-                    audioMgr.sourceNode.connect(analyser);
+                    analyser = audioMgr.sharedAnalyser;
+                    if (!analyser) {
+                        analyser = audioCtx.createAnalyser();
+                        analyser.fftSize = 2048;
+                        analyser.smoothingTimeConstant = 0.3;
+                        audioMgr.sourceNode.connect(analyser);
+                    }
 
                     timeData = new Float32Array(analyser.fftSize);
                     freqData = new Uint8Array(analyser.frequencyBinCount);
@@ -2075,7 +2702,9 @@
              * Detects vocal fundamental frequency (Pitch / F0) using normalized autocorrelation.
              * Returns { pitch: number, isVoiced: boolean, rms: number }
              */
-            function analyzeAcousticFrame() {
+            // PERF: accepts runFullPitch flag to skip expensive autocorrelation on alternate ticks
+            function analyzeAcousticFrame(runFullPitch) {
+                if (runFullPitch === undefined) runFullPitch = true;
                 if (!analyser || !timeData || !freqData) {
                     return {
                         pitch: CONFIG.pitch.baseline,
@@ -2109,7 +2738,12 @@
                 let detectedPitch = CONFIG.pitch.baseline;
                 let isVoiced = false;
 
-                if (!isSilent) {
+                // PERF: only run expensive autocorrelation when runFullPitch is true;
+                // on skipped ticks, reuse cached pitch result for smooth display
+                if (!runFullPitch) {
+                    detectedPitch = lastPitchResult.pitch;
+                    isVoiced = lastPitchResult.isVoiced;
+                } else if (!isSilent) {
                     const minLag = Math.floor(sampleRate / CONFIG.pitch.max); // ~400 Hz
                     const maxLag = Math.ceil(sampleRate / CONFIG.pitch.min);  // ~75 Hz
                     const windowSize = 1024;
@@ -2167,6 +2801,8 @@
                             }
                         }
                     }
+                    // Cache result for skipped ticks
+                    lastPitchResult = { pitch: detectedPitch, isVoiced: isVoiced };
                 }
 
                 // 3. Frequency Spectrum for Spectrogram
@@ -2221,6 +2857,11 @@
                 if (spectrogramBuffer.length > CONFIG.maxPoints) spectrogramBuffer.shift();
             }
 
+            // PERF: throttle pitch autocorrelation to every other tick (~70ms) while
+            // RMS/energy/spectrogram still update every tick for smooth visuals
+            let pitchTickCounter = 0;
+            let lastPitchResult = { pitch: CONFIG.pitch.baseline, isVoiced: false };
+
             // Data sampling loop
             setInterval(() => {
                 if (externalDataSource) {
@@ -2229,7 +2870,9 @@
                     if (extFrame) pushAudioFrame(extFrame);
                 } else if (audioState === 'active') {
                     // Live microphone source
-                    const frame = analyzeAcousticFrame();
+                    pitchTickCounter++;
+                    const runFullPitch = (pitchTickCounter % 2 === 0);
+                    const frame = analyzeAcousticFrame(runFullPitch);
                     pushAudioFrame(frame);
                 }
                 // When in 'waiting' state, no continuous animation occurs!
@@ -2399,9 +3042,10 @@
 
                 // Only scroll and paint new columns when active data is arriving
                 if (audioState === 'active' || externalDataSource) {
-                    // Scroll image 1 pixel left
-                    const imgData = spectroImageCtx.getImageData(1, 0, w - 1, h);
-                    spectroImageCtx.putImageData(imgData, 0, 0);
+                    // PERF: replaced getImageData/putImageData scroll with faster drawImage blit
+                    spectroImageCtx.drawImage(spectroImageCanvas, -1, 0);
+                    // Clear the rightmost column to prevent stale pixel seam
+                    spectroImageCtx.clearRect(w - 1, 0, 1, h);
 
                     // Draw latest column on right
                     const bins = spectrogramBuffer[spectrogramBuffer.length - 1];
@@ -2475,10 +3119,12 @@
 
             // 60 FPS Render Loop
             function renderLoop() {
+                requestAnimationFrame(renderLoop);
+                // PERF: skip canvas rendering when tab is hidden to avoid wasted CPU/GPU work
+                if (!window.isPageVisible) return;
                 if (pitchGfx) renderPitch(pitchGfx);
                 if (energyGfx) renderEnergy(energyGfx);
                 if (spectroGfx) renderSpectrogram(spectroGfx);
-                requestAnimationFrame(renderLoop);
             }
             requestAnimationFrame(renderLoop);
 
