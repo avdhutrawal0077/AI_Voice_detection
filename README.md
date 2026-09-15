@@ -1,2 +1,2 @@
-# lecture_summarizer
+# AI_VOICE_DETECTION
 SIH hackathon project prototype 
