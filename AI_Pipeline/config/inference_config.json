@@ -1,0 +1,33 @@
+{
+  "preprocessing": {
+    "ZIP_PATH": "D:\\SIH\\AI_Voice_Detection\\data\\hf_cache\\hub\\datasets--mueller91--In-The-Wild\\snapshots\\eee168f92c367f8c82ff2cf42b6f61e362fd6211\\release_in_the_wild.zip",
+    "TARGET_SR": 16000,
+    "TARGET_SAMPLES": 64000,
+    "TARGET_DURATION": 4.0,
+    "MEL_N_FFT": 1024,
+    "MEL_HOP_LENGTH": 256,
+    "MEL_N_MELS": 128,
+    "MEL_FMIN": 80.0,
+    "MEL_FMAX": 8000.0,
+    "DEVICE": "cuda"
+  },
+  "thresholds": {
+    "high_threshold": 0.7100000000000004,
+    "low_threshold": 0.2899999999999996,
+    "description": {
+      "above_high": "AI \u2014 high confidence fake",
+      "below_low": "HUMAN \u2014 high confidence real",
+      "between": "UNCERTAIN \u2014 insufficient evidence"
+    }
+  },
+  "model_a_path": "../models/model_a_branch_a.json",
+  "model_b_path": "../models/model_b_branch_b.json",
+  "model_c_path": "../models/model_c_fusion.pkl",
+  "scaler_path": "../models/branch_b_scaler.pkl",
+  "wav2vec2_model": "facebook/wav2vec2-base",
+  "feature_dim": {
+    "branch_a": 768,
+    "branch_b": 38,
+    "fusion": 5
+  }
+}
