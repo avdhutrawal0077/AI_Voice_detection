@@ -57,6 +57,13 @@ class AudioChunk(BaseModel):
     sample_rate: int = Field(..., description="Sample rate (e.g., 16000)")
     format: str = Field(..., description="Audio format (e.g., mono_float32)")
 
+    @field_validator('sample_rate')
+    @classmethod
+    def validate_sample_rate(cls, v):
+        if v != settings.sample_rate:
+            raise ValueError(f"Sample rate must be exactly {settings.sample_rate} Hz")
+        return v
+
     @field_validator('format')
     @classmethod
     def validate_format(cls, v):
@@ -88,23 +95,18 @@ class BranchTiming(BaseModel):
     model_b_ms: float
     model_c_ms: float
 
-class TemporalSmoothing(BaseModel):
-    verdict: str = Field(..., description="Verdict based on smoothed score")
-    smoothed_p_fake: float = Field(..., description="Smoothed confidence score")
-    uncertain: bool = Field(..., description="Whether the smoothed score is uncertain")
-    windows_seen: int = Field(..., description="Number of windows seen so far")
-
 class PipelineResponse(BaseModel):
-    verdict: str
-    confidence: float
-    uncertain: bool
-    p_fake: float
+    verdict: str = Field(..., description="Authoritative verdict derived from smoothed_p_fake")
+    confidence: float = Field(..., description="Confidence score based on smoothed_p_fake")
+    uncertain: bool = Field(..., description="Whether the smoothed result is uncertain")
+    p_fake: float = Field(..., description="Raw probability from the fusion model")
+    smoothed_p_fake: float = Field(..., description="Temporally smoothed probability")
+    windows_seen: int = Field(..., description="Number of windows seen by the smoother")
     p_a: float
     p_b: float
     processing_time_ms: float
     branch_timing: BranchTiming
     acoustic_features: AcousticFeatures
-    temporal_smoothing: TemporalSmoothing
 
 class StreamResponse(BaseModel):
     session_id: str

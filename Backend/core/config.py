@@ -14,7 +14,11 @@ class Settings(BaseSettings):
     # Sample rate:            16,000 Hz
     sample_rate:          int   = 16000
     inference_window_sec: float = 2.0
-    hop_duration_sec:     float = 1.0   # 50% overlap: hop = inference_window_sec / 2
+    
+    @property
+    def hop_duration_sec(self) -> float:
+        """Architecturally mandated 50% overlap."""
+        return self.inference_window_sec / 2.0
 
     # ── Verdict Thresholds (mirrors AI_Pipeline/models/thresholds.json) ───
     # p_fake >= high_threshold → AI verdict
@@ -31,6 +35,7 @@ class Settings(BaseSettings):
     # ── AI Pipeline Path ───────────────────────────────────────────────────
     ai_pipeline_dir:  str  = "../AI_Pipeline"
     use_real_pipeline: bool = True
+    use_mock_pipeline: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

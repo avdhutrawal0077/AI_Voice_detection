@@ -40,16 +40,19 @@ flowchart TD
             BranchB --> Fusion
         end
 
-        Fusion --> TS[Temporal Smoother - Exponential Smoothing]
+        Fusion --> RAW[Raw Probability: p_fake]
+        RAW --> TS[Temporal Smoother - Exponential Smoothing]
+        TS --> SMOOTH[Smoothed Probability: smoothed_p_fake]
+        SMOOTH --> VERDICT[One Authoritative Verdict]
     end
 
     subgraph Persistence ["Persistence Layer"]
-        TS --> DB[(MongoDB: voice_detection)]
+        VERDICT --> DB[(MongoDB: voice_detection)]
         DB --> WRes[(Collection: window_results)]
         DB --> Sess[(Collection: sessions)]
     end
 
-    TS ==>|Real-time Verdict & Acoustic Telemetry| Endpoint
+    VERDICT ==>|Real-time Verdict & Acoustic Telemetry| Endpoint
     Endpoint ==>|JSON StreamResponse| WSClient
     WSClient --> PDF[Forensic PDF Audit Report Exporter]
 ```
@@ -90,10 +93,7 @@ d:\SIH FINAL\
 │   │   └── endpoints/
 │   │       ├── health.py         # System health & DB ping
 │   │       ├── auth.py           # User registration (signup) & login
-│   │       ├── ingestion.py      # WebSocket stream & session summary
-│   │       ├── analyze.py        # Batch audio analysis endpoint
-│   │       ├── stream.py         # Streaming REST fallbacks
-│   │       └── results.py        # Historical results query
+│   │       └── ingestion.py      # WebSocket stream & session summary
 │   ├── core/
 │   │   └── config.py             # Pydantic Settings & environment vars
 │   ├── db/
@@ -102,9 +102,7 @@ d:\SIH FINAL\
 │   │   └── schemas.py            # Pydantic data contracts (AudioChunk, etc.)
 │   ├── services/
 │   │   ├── ai_pipeline.py        # Integration bridge to AI_Pipeline
-│   │   ├── session_manager.py    # Chunk reordering, buffering & session state
-│   │   ├── audio_processing.py   # Raw byte to PCM conversions
-│   │   └── aggregation.py        # Verdict scoring logic
+│   │   └── session_manager.py    # Chunk reordering, buffering & session state
 │   ├── main.py                   # FastAPI application initialization
 │   ├── requirements.txt          # Backend dependencies
 │   ├── test_client.py            # Basic integration test
@@ -131,7 +129,7 @@ d:\SIH FINAL\
 #### 1. `audio-chunk-processor.js` (AudioWorklet)
 * **What it does:** Runs inside the browser's dedicated low-latency audio rendering thread, completely decoupled from the main JavaScript execution loop.
 * **Why it's in the system:** Standard JavaScript `onaudioprocess` runs on the main thread and stutters when the UI renders animations or Three.js frames. The AudioWorklet ensures that audio capture is 100% glitch-free and buffers exactly 16,000 float32 samples per second.
-* **Key Mechanism:** Slices raw input into uniform 0.5s or 1.0s chunks and posts them via `MessagePort` to the main window.
+* **Key Mechanism:** Slices raw input into uniform 250 ms chunks and posts them via `MessagePort` to the main window.
 
 #### 2. `code.html` (Complete Dashboard)
 * **What it does:** 

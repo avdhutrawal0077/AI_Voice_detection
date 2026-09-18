@@ -36,11 +36,7 @@ class WaveSpectrumDetector:
 
     def __init__(self):
         pre_cfg = _load_config("preprocessing_config.json")
-        thresh  = json.load(open(
-            os.path.join(BASE_DIR, "..", "models", "thresholds.json")))
-
-        self.HIGH_THRESHOLD = thresh["high_threshold"]
-        self.LOW_THRESHOLD  = thresh["low_threshold"]
+        # Thresholds are now managed externally via the core configuration.
 
         self.wav2vec2 = Wav2Vec2Model.from_pretrained(
             "facebook/wav2vec2-base", use_safetensors=True).to(DEVICE)
@@ -327,24 +323,11 @@ class WaveSpectrumDetector:
         p_fake  = self.model_c.predict_proba(fusion)[0, 1]
         time_c  = (time.time() - t_c) * 1000
 
-        if p_fake >= self.HIGH_THRESHOLD:
-            verdict, uncertain = "AI", False
-            confidence         = float(p_fake)
-        elif p_fake <= self.LOW_THRESHOLD:
-            verdict, uncertain = "HUMAN", False
-            confidence         = float(1 - p_fake)
-        else:
-            verdict, uncertain = "UNCERTAIN", True
-            confidence         = float(1 - abs(p_fake-0.5)*2)
-
         # Extract acoustic biomarkers for frontend display
         acoustic  = self.extract_acoustic_features(audio, audio_np)
         total_ms  = (time.time() - t_start) * 1000
 
         return {
-            'verdict'            : verdict,
-            'confidence'         : round(confidence, 4),
-            'uncertain'          : uncertain,
             'p_fake'             : round(float(p_fake),  4),
             'p_a'                : round(float(p_a),     4),
             'p_b'                : round(float(p_b),     4),
@@ -400,13 +383,17 @@ class TemporalSmoother:
 
         if smoothed >= self.high:
             verdict, uncertain = "AI", False
+            confidence = float(smoothed)
         elif smoothed <= self.low:
             verdict, uncertain = "HUMAN", False
+            confidence = float(1 - smoothed)
         else:
             verdict, uncertain = "UNCERTAIN", True
+            confidence = float(1 - abs(smoothed - 0.5) * 2)
 
         return {
             "verdict"              : verdict,
+            "confidence"           : round(confidence, 4),
             "smoothed_p_fake"      : round(smoothed, 4),
             "moving_average_score" : round(smoothed, 4),  # alias used by frontend
             "uncertain"            : uncertain,

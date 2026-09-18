@@ -41,7 +41,7 @@ class PipelineService:
         if not _pipeline_available:
             return None
         if session_id not in cls._session_smoothers:
-            cls._session_smoothers[session_id] = TemporalSmoother()
+            cls._session_smoothers[session_id] = TemporalSmoother(high=settings.high_threshold, low=settings.low_threshold)
         return cls._session_smoothers[session_id]
         
     @classmethod
@@ -64,16 +64,17 @@ class PipelineService:
             
             # 3. Merge and return as dict mapping to PipelineResponse
             return {
-                "verdict": result["verdict"],
-                "confidence": result["confidence"],
-                "uncertain": result["uncertain"],
+                "verdict": smoothed["verdict"],
+                "confidence": smoothed["confidence"],
+                "uncertain": smoothed["uncertain"],
                 "p_fake": result["p_fake"],
+                "smoothed_p_fake": smoothed["smoothed_p_fake"],
+                "windows_seen": smoothed["windows_seen"],
                 "p_a": result["p_a"],
                 "p_b": result["p_b"],
                 "processing_time_ms": result["processing_time_ms"],
                 "branch_timing": result["branch_timing"],
-                "acoustic_features": result["acoustic_features"],
-                "temporal_smoothing": smoothed
+                "acoustic_features": result["acoustic_features"]
             }
         except Exception as e:
             logger.error(f"Error during AI inference: {e}")
@@ -81,6 +82,9 @@ class PipelineService:
             
     @classmethod
     def _mock_predict(cls, pcm_list: List[float], session_id: str) -> dict:
+        if not getattr(settings, 'use_mock_pipeline', False):
+            raise RuntimeError("Real AI pipeline is unavailable and mock pipeline is disabled.")
+            
         # Generate mock dynamic confidence scores
         import numpy as np
         base_score = 0.85 + (np.random.random() * 0.1) # 0.85 to 0.95
@@ -90,6 +94,8 @@ class PipelineService:
             "confidence": base_score,
             "uncertain": False,
             "p_fake": base_score,
+            "smoothed_p_fake": base_score,
+            "windows_seen": 1,
             "p_a": base_score - 0.02,
             "p_b": base_score + 0.01,
             "processing_time_ms": 25.0,
@@ -107,11 +113,5 @@ class PipelineService:
                 "rms_energy_db": -20.0,
                 "speech_rate_syll_per_sec": 4.5,
                 "pause_ratio_percent": 10.0
-            },
-            "temporal_smoothing": {
-                "verdict": "AI",
-                "smoothed_p_fake": base_score,
-                "uncertain": False,
-                "windows_seen": 1
             }
         }

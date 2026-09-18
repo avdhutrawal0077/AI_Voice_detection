@@ -104,10 +104,11 @@ class AudioSession:
                             "p_fake": result.p_fake,
                             "p_a": result.p_a,
                             "p_b": result.p_b,
+                            "smoothed_p_fake": result.smoothed_p_fake,
+                            "windows_seen": result.windows_seen,
                             "processing_time_ms": result.processing_time_ms,
                             "branch_timing": result.branch_timing.model_dump(),
-                            "acoustic_features": result.acoustic_features.model_dump(),
-                            "temporal_smoothing": result.temporal_smoothing.model_dump()
+                            "acoustic_features": result.acoustic_features.model_dump()
                         })
                 except Exception as e:
                     logger.error(f"Failed to save window result to DB: {e}")
@@ -132,6 +133,50 @@ class SessionManager:
             del self.sessions[session_id]
             InferenceEngine.clear_session(session_id)
 
+    async def finalize_session(self, session_id: str):
+        """
+        Finalizes the session in the DB by aggregating window results, 
+        calculating the authoritative verdict, and marking it completed.
+        Cleans up the in-memory state.
+        """
+        db = get_db()
+        if db is not None:
+            try:
+                results = await db.window_results.find({"session_id": session_id}).to_list(length=None)
+                if results:
+                    avg_p_fake = sum(r.get("smoothed_p_fake", r.get("p_fake", 0))) / len(results)
+                    
+                    if avg_p_fake >= settings.high_threshold:
+                        final_verdict = "AI"
+                    elif avg_p_fake <= settings.low_threshold:
+                        final_verdict = "HUMAN"
+                    else:
+                        final_verdict = "UNCERTAIN"
+                        
+                    await db.sessions.update_one(
+                        {"session_id": session_id},
+                        {"$set": {
+                            "status": "completed",
+                            "end_time": datetime.now(timezone.utc),
+                            "final_verdict": final_verdict,
+                            "final_p_fake": round(avg_p_fake, 4),
+                            "total_windows": len(results)
+                        }}
+                    )
+                else:
+                    await db.sessions.update_one(
+                        {"session_id": session_id},
+                        {"$set": {
+                            "status": "completed",
+                            "end_time": datetime.now(timezone.utc),
+                            "total_windows": 0
+                        }}
+                    )
+            except Exception as e:
+                logger.error(f"Failed to finalize session {session_id} in DB: {e}")
+                
+        self.remove_session(session_id)
+
     async def cleanup_idle_sessions(self):
         while True:
             now = datetime.now(timezone.utc)
@@ -140,8 +185,8 @@ class SessionManager:
                 if (now - session.last_activity).total_seconds() > settings.session_timeout_sec:
                     expired.append(sid)
             for sid in expired:
-                logger.warning(f"Session {sid} timed out and is being cleaned up.")
-                self.remove_session(sid)
+                logger.warning(f"Session {sid} timed out and is being finalized.")
+                await self.finalize_session(sid)
             await asyncio.sleep(10) # Check every 10 seconds
 
 # Global singleton

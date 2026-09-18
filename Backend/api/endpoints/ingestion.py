@@ -66,44 +66,8 @@ async def websocket_audio(websocket: WebSocket, session_id: str):
     except Exception as e:
         logger.error(f"Unexpected error in WebSocket for session {session_id}: {e}")
     finally:
-        # Bug 3: Complete Session Lifecycle in DB
-        db = get_db()
-        if db is not None:
-            try:
-                results = await db.window_results.find({"session_id": session_id}).to_list(length=None)
-                if results:
-                    avg_p_fake = sum(r["p_fake"] for r in results) / len(results)
-                    if avg_p_fake >= settings.high_threshold:
-                        final_verdict = "AI"
-                    elif avg_p_fake <= settings.low_threshold:
-                        final_verdict = "HUMAN"
-                    else:
-                        final_verdict = "UNCERTAIN"
-                        
-                    await db.sessions.update_one(
-                        {"session_id": session_id},
-                        {"$set": {
-                            "status": "completed",
-                            "end_time": datetime.now(timezone.utc),
-                            "final_verdict": final_verdict,
-                            "final_p_fake": round(avg_p_fake, 4),
-                            "total_windows": len(results)
-                        }}
-                    )
-                else:
-                    # No windows processed
-                    await db.sessions.update_one(
-                        {"session_id": session_id},
-                        {"$set": {
-                            "status": "completed",
-                            "end_time": datetime.now(timezone.utc),
-                            "total_windows": 0
-                        }}
-                    )
-            except Exception as e:
-                logger.error(f"Failed to complete session {session_id} in DB: {e}")
-                
-        session_manager.remove_session(session_id)
+        # Bug 3: Complete Session Lifecycle in DB via SessionManager
+        await session_manager.finalize_session(session_id)
 
 async def _send_error(websocket: WebSocket, session_id: str, error: str, details: str = None):
     error_resp = ErrorResponse(
@@ -140,33 +104,33 @@ async def get_session_summary(session_id: str):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available (running in memory mode)")
         
+    session_doc = await db.sessions.find_one({"session_id": session_id})
+    if not session_doc:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    if session_doc.get("status") != "completed":
+        # If it's still in progress, we can return the current state, 
+        # but for simplicity, let's wait until it's finalized or just return what we have.
+        pass
+        
+    # Also fetch window results for the timeline
     cursor = db.window_results.find({"session_id": session_id}).sort("timestamp", 1)
     results = await cursor.to_list(length=1000)
     
-    if not results:
-        raise HTTPException(status_code=404, detail="Session not found or no data")
-        
-    # Bug 2: Use correct verdict rule
-    total_chunks = len(results)
-    avg_p_fake = sum(r["p_fake"] for r in results) / total_chunks
-    avg_confidence = sum(r["confidence"] for r in results) / total_chunks
-    
-    if avg_p_fake >= settings.high_threshold:
-        final_verdict = "AI"
-    elif avg_p_fake <= settings.low_threshold:
-        final_verdict = "HUMAN"
-    else:
-        final_verdict = "UNCERTAIN"
+    total_chunks = session_doc.get("total_windows", 0)
+    final_verdict = session_doc.get("final_verdict", "UNCERTAIN")
+    avg_p_fake = session_doc.get("final_p_fake", 0.0)
+    status = session_doc.get("status", "in_progress")
     
     timestamps = [r["timestamp"].timestamp() if hasattr(r["timestamp"], "timestamp") else r["timestamp"] for r in results]
-    window_scores = [r["p_fake"] for r in results]
+    window_scores = [r.get("smoothed_p_fake", r.get("p_fake", 0.0)) for r in results]
     
     return SessionSummaryResponse(
         session_id=session_id,
         total_chunks=total_chunks,
         final_verdict=final_verdict,
-        average_confidence=avg_confidence,
+        average_confidence=avg_p_fake, # mapped to average_confidence for legacy frontend compat
         timestamps=timestamps,
         window_scores=window_scores,
-        status="completed"
+        status=status
     )
