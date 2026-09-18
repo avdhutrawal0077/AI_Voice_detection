@@ -43,7 +43,7 @@ class WaveSpectrumDetector:
         self.LOW_THRESHOLD  = thresh["low_threshold"]
 
         self.wav2vec2 = Wav2Vec2Model.from_pretrained(
-            "facebook/wav2vec2-base", use_safetensors=True).to(DEVICE)
+            "facebook/wav2vec2-large-xlsr-53", use_safetensors=True).to(DEVICE)
         self.wav2vec2.eval()
         for p in self.wav2vec2.parameters():
             p.requires_grad = False
