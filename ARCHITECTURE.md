@@ -54,6 +54,17 @@ flowchart TD
     WSClient --> PDF[Forensic PDF Audit Report Exporter]
 ```
 
+### Pipeline Timing Chain
+
+The temporal flow of audio data from microphone to model inference is precisely configured:
+
+1. **AudioWorklet Chunk:** 250 ms (captured at the edge)
+2. **Silero VAD:** Processes chunks immediately for voice activity
+3. **Detection Window:** 2.0 seconds (buffered in backend)
+4. **Inference Hop:** 1.0 second (50% sliding window overlap)
+5. **Zero Padding:** Padded to 4.0 seconds (during AI pipeline preprocessing)
+6. **Model Input:** 64,000 samples (4s × 16kHz)
+
 ---
 
 ## 3. Directory & Component Breakdown
@@ -173,11 +184,10 @@ The brain of the system. Contains the `WaveSpectrumDetector` and `TemporalSmooth
 * **Branch A (Wav2Vec 2.0 + XGBoost):**
   * *Architecture:* Pretrained `facebook/wav2vec2-base` (loaded via safe, zero-copy safetensors) extracts 768-dimensional latent representations.
   * *Classifier:* A gradient-boosted decision tree (`model_a_branch_a.json`) trained to identify subtle mathematical artifacts left by neural vocoders (like HiFi-GAN, WaveGlow).
-* **Branch B (Acoustic Biometrics + Spectral Features):**
-  * *Biometrics:* Praat Parselmouth extracts pitch ($F_0$), micro-pitch perturbations (**jitter**), amplitude perturbations (**shimmer**), and glottal wave purity (**HNR**).
-  * *Spectral:* Computes Mel-Spectrograms (80 filter banks) and MFCCs (13 coefficients).
+* **Branch B (Acoustic & Spectral ML Features):**
+  * *ML Inputs:* Statistical spectral and acoustic features including MFCC mean/std, spectral centroid, bandwidth, spectral rolloff, spectral flux, RMS, and Zero Crossing Rate (ZCR).
   * *Classifier:* Scaled via `branch_b_scaler.pkl` and evaluated by `model_b_branch_b.json`.
-  * *Why:* AI voice cloners cannot reproduce the micro-muscle tremors and physical glottal dynamics of a human vocal cord. Jitter and shimmer values in synthetic audio are either unnaturally static or artificially noisy.
+  * *Separate Acoustic Evidence (Dashboard/Report Only):* Praat Parselmouth extracts pitch ($F_0$), micro-pitch perturbations (**jitter**), amplitude perturbations (**shimmer**), and glottal wave purity (**HNR**). These are passed directly to the telemetry output to explain the human vocal cord biomechanics, but are *not* directly ingested by the XGBoost model.
 * **Branch C (Fusion Meta-Classifier):**
   * *Architecture:* A calibrated Logistic Regression model (`model_c_fusion.pkl`) taking probability outputs from Branch A and Branch B to yield a unified $P(\text{fake})$ score.
 * **Temporal Smoother:**

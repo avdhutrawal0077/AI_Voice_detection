@@ -186,8 +186,7 @@ class WaveSpectrumDetector:
             actual_dur     = actual_samples / TARGET_SR
         else:
             actual_samples = len(audio_np)
-            actual_dur     = sound.duration if hasattr(self, '_sound') \
-                            else TARGET_SAMPLES / TARGET_SR
+            actual_dur     = actual_samples / TARGET_SR
 
         # ── 3. Pause Ratio (%) ─────────────────────────────────────────────
         frame_len     = self._pre_cfg['MEL_HOP_LENGTH']
@@ -369,30 +368,52 @@ class WaveSpectrumDetector:
 
 
 class TemporalSmoother:
+    """
+    Exponential Moving Average (EMA) smoother for per-window p_fake scores.
 
-    def __init__(self, window_size=5, high=0.75, low=0.35):
-        self.window_size = window_size
-        self.high        = high
-        self.low         = low
-        self.history     = []
+    Computes:  S(t) = alpha * P(t) + (1 - alpha) * S(t-1)
 
-    def update(self, p_fake):
-        self.history.append(p_fake)
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-        smoothed = float(np.mean(self.history))
+    alpha: smoothing factor in (0, 1].
+           - Higher alpha = more reactive to the latest window.
+           - Lower  alpha = smoother, slower to change.
+           Default 0.3 is roughly equivalent to a 5-window SMA in responsiveness.
+    """
+
+    def __init__(self, alpha: float = 0.3, high: float = 0.75, low: float = 0.35):
+        self.alpha         = alpha
+        self.high          = high
+        self.low           = low
+        self._ema: float | None = None   # None until first window seen
+        self._windows_seen = 0
+
+    def update(self, p_fake: float) -> dict:
+        p_fake = float(p_fake)
+
+        if self._ema is None:
+            # Bootstrap: first observation initialises the EMA directly
+            self._ema = p_fake
+        else:
+            self._ema = self.alpha * p_fake + (1 - self.alpha) * self._ema
+
+        self._windows_seen += 1
+        smoothed = self._ema
+
         if smoothed >= self.high:
             verdict, uncertain = "AI", False
         elif smoothed <= self.low:
             verdict, uncertain = "HUMAN", False
         else:
             verdict, uncertain = "UNCERTAIN", True
+
         return {
-            "verdict"          : verdict,
-            "smoothed_p_fake"  : round(smoothed, 4),
-            "uncertain"        : uncertain,
-            "windows_seen"     : len(self.history)
+            "verdict"              : verdict,
+            "smoothed_p_fake"      : round(smoothed, 4),
+            "moving_average_score" : round(smoothed, 4),  # alias used by frontend
+            "uncertain"            : uncertain,
+            "windows_seen"         : self._windows_seen,
+            "trend"                : "stable",             # extensible field
         }
 
     def reset(self):
-        self.history = []
+        self._ema          = None
+        self._windows_seen = 0

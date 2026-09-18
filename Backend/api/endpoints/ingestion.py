@@ -6,6 +6,8 @@ import logging
 
 from models.schemas import AudioChunk, ErrorResponse, StreamResponse, SessionSummaryResponse
 from services.session_manager import session_manager
+from core.config import settings
+from db.database import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -15,6 +17,19 @@ async def websocket_audio(websocket: WebSocket, session_id: str):
     await websocket.accept()
     session = session_manager.get_or_create_session(session_id)
     
+    # Bug 3: Create Session Lifecycle in DB
+    db = get_db()
+    if db is not None:
+        try:
+            await db.sessions.insert_one({
+                "session_id": session_id,
+                "start_time": datetime.now(timezone.utc),
+                "status": "in_progress",
+                "source_type": "websocket_stream"
+            })
+        except Exception as e:
+            logger.error(f"Failed to create session {session_id} in DB: {e}")
+
     try:
         while True:
             # The client sends JSON string payloads
@@ -51,6 +66,43 @@ async def websocket_audio(websocket: WebSocket, session_id: str):
     except Exception as e:
         logger.error(f"Unexpected error in WebSocket for session {session_id}: {e}")
     finally:
+        # Bug 3: Complete Session Lifecycle in DB
+        db = get_db()
+        if db is not None:
+            try:
+                results = await db.window_results.find({"session_id": session_id}).to_list(length=None)
+                if results:
+                    avg_p_fake = sum(r["p_fake"] for r in results) / len(results)
+                    if avg_p_fake >= settings.high_threshold:
+                        final_verdict = "AI"
+                    elif avg_p_fake <= settings.low_threshold:
+                        final_verdict = "HUMAN"
+                    else:
+                        final_verdict = "UNCERTAIN"
+                        
+                    await db.sessions.update_one(
+                        {"session_id": session_id},
+                        {"$set": {
+                            "status": "completed",
+                            "end_time": datetime.now(timezone.utc),
+                            "final_verdict": final_verdict,
+                            "final_p_fake": round(avg_p_fake, 4),
+                            "total_windows": len(results)
+                        }}
+                    )
+                else:
+                    # No windows processed
+                    await db.sessions.update_one(
+                        {"session_id": session_id},
+                        {"$set": {
+                            "status": "completed",
+                            "end_time": datetime.now(timezone.utc),
+                            "total_windows": 0
+                        }}
+                    )
+            except Exception as e:
+                logger.error(f"Failed to complete session {session_id} in DB: {e}")
+                
         session_manager.remove_session(session_id)
 
 async def _send_error(websocket: WebSocket, session_id: str, error: str, details: str = None):
@@ -84,8 +136,6 @@ async def get_session_summary(session_id: str):
     """
     Returns the final summary for a session.
     """
-    from db.database import get_db
-    
     db = get_db()
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available (running in memory mode)")
@@ -96,9 +146,17 @@ async def get_session_summary(session_id: str):
     if not results:
         raise HTTPException(status_code=404, detail="Session not found or no data")
         
+    # Bug 2: Use correct verdict rule
     total_chunks = len(results)
+    avg_p_fake = sum(r["p_fake"] for r in results) / total_chunks
     avg_confidence = sum(r["confidence"] for r in results) / total_chunks
-    final_verdict = "AI" if avg_confidence > 0.5 else "HUMAN"
+    
+    if avg_p_fake >= settings.high_threshold:
+        final_verdict = "AI"
+    elif avg_p_fake <= settings.low_threshold:
+        final_verdict = "HUMAN"
+    else:
+        final_verdict = "UNCERTAIN"
     
     timestamps = [r["timestamp"].timestamp() if hasattr(r["timestamp"], "timestamp") else r["timestamp"] for r in results]
     window_scores = [r["p_fake"] for r in results]

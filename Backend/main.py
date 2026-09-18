@@ -52,9 +52,7 @@ app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(ingestion.router, tags=["Ingestion"])
 # The old endpoints depend on heavy ML libs that have been moved to the ML team's domain.
-# app.include_router(analyze.router, prefix="/api/v1", tags=["Analyze"])
-# app.include_router(stream.router, prefix="/api/v1", tags=["Stream"])
-# app.include_router(results.router, prefix="/api/v1", tags=["Results"])
+# They have been successfully deleted along with their legacy services.
 
 if __name__ == "__main__":
     import uvicorn
