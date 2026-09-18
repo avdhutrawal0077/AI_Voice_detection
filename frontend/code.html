@@ -1259,6 +1259,17 @@
                             this.sourceNode.connect(this.sharedAnalyser);
                         }
 
+                        // --- Session isolation: reset VAD + chunk queue before new session ---
+                        // This prevents LSTM state, context tail, and buffered samples from
+                        // Session A leaking into Session B.
+                        if (window.TrueToneSileroVAD) {
+                            window.TrueToneSileroVAD.resetState();
+                        }
+                        if (window.TrueToneChunkManager) {
+                            window.TrueToneChunkManager.clear();
+                            window.TrueToneChunkManager._nextId = 0;
+                        }
+
                         // --- AudioWorklet: load chunk processor and connect ---
                         await this._initChunkWorklet();
 
@@ -1363,7 +1374,11 @@
                                 channelCountMode: 'explicit',
                                 channelInterpretation: 'speakers',
                                 processorOptions: {
-                                    chunkDurationMs: chunkDurationMs
+                                    chunkDurationMs: chunkDurationMs,
+                                    // Guarantee 16 kHz output regardless of native AudioContext rate.
+                                    // The worklet's built-in linear-interpolation resampler converts
+                                    // any native rate (e.g. 48 kHz) to this target before postMessage.
+                                    targetSampleRate: 16000
                                 }
                             }
                         );
@@ -1640,6 +1655,14 @@
                 /** Chunks received before model was ready — will be processed once loaded */
                 _pendingChunks: [],
 
+                /**
+                 * Promise chain used to serialise all _processChunk() calls.
+                 * Each incoming chunk is appended to this chain so that Chunk B
+                 * never begins ONNX inference while Chunk A is still running,
+                 * preventing concurrent mutation of _lstmState / _contextTail.
+                 */
+                _processingChain: Promise.resolve(),
+
                 // --- Silero VAD v5 frame parameters ---
                 /** New audio samples per frame (512 at 16kHz = 32ms) */
                 FRAME_NEW_SAMPLES: 512,
@@ -1747,8 +1770,13 @@
                         return;
                     }
 
-                    // Model is ready — process asynchronously
-                    this._processChunk(chunkMeta);
+                    // Model is ready — serialise via promise chain.
+                    // Chaining ensures Chunk B cannot start ONNX inference while
+                    // Chunk A is still inside await this._session.run(), so
+                    // _lstmState and _contextTail are never mutated concurrently.
+                    this._processingChain = this._processingChain
+                        .then(() => this._processChunk(chunkMeta))
+                        .catch(() => { /* errors handled inside _processChunk */ });
                 },
 
                 /**
@@ -1899,6 +1927,10 @@
                     this._contextTail.fill(0);
                     this._sampleBuffer = [];
                     this._bufferedSampleCount = 0;
+                    // Reset the processing chain so no in-flight chunks from
+                    // a previous session can bleed into the new one.
+                    this._processingChain = Promise.resolve();
+                    this._pendingChunks = [];
                     console.info('TrueToneSileroVAD: State reset.');
                 }
             };
