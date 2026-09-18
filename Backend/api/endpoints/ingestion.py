@@ -21,14 +21,18 @@ async def websocket_audio(websocket: WebSocket, session_id: str):
     db = get_db()
     if db is not None:
         try:
-            await db.sessions.insert_one({
-                "session_id": session_id,
-                "start_time": datetime.now(timezone.utc),
-                "status": "in_progress",
-                "source_type": "websocket_stream"
-            })
+            await db.sessions.update_one(
+                {"session_id": session_id},
+                {"$setOnInsert": {
+                    "session_id": session_id,
+                    "start_time": datetime.now(timezone.utc),
+                    "status": "in_progress",
+                    "source_type": "websocket_stream"
+                }},
+                upsert=True
+            )
         except Exception as e:
-            logger.error(f"Failed to create session {session_id} in DB: {e}")
+            logger.error(f"Failed to create/upsert session {session_id} in DB: {e}")
 
     try:
         while True:

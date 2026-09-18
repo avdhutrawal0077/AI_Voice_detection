@@ -9,15 +9,15 @@ class Settings(BaseSettings):
     # ── Canonical Streaming Pipeline Configuration ────────────────────────
     # AudioWorklet chunk:     250 ms  (configured in frontend)
     # Inference window:       2.0 sec (inference_window_sec)
-    # Inference hop (50%):    1.0 sec (hop_duration_sec)
+    # Inference hop (50%):    derived — always inference_window_sec / 2
     # Model input (padded):   4.0 sec (TARGET_SAMPLES=64000 in AI_Pipeline)
     # Sample rate:            16,000 Hz
     sample_rate:          int   = 16000
     inference_window_sec: float = 2.0
-    
+
     @property
     def hop_duration_sec(self) -> float:
-        """Architecturally mandated 50% overlap."""
+        """50% overlap — hop is always derived from inference_window_sec, never independently configured."""
         return self.inference_window_sec / 2.0
 
     # ── Verdict Thresholds (mirrors AI_Pipeline/models/thresholds.json) ───

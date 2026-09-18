@@ -5,9 +5,9 @@
 **True Tone** is a real-time, multi-branch artificial intelligence system designed to detect synthesized, cloned, and deepfake human speech during live audio streams (such as phone calls, video conferences, or live recordings).
 
 Detecting modern AI voice cloning requires more than simple spectral analysis. State-of-the-art text-to-speech (TTS) and voice conversion (VC) models (e.g., ElevenLabs, XTTS, VITS) replicate human pitch and timbre with extreme fidelity. To counter this, True Tone uses a **tri-branch ensemble architecture**:
-1. **Branch A (Deep Acoustic Embeddings):** Captures high-level latent representations and neural vocoder artifacts using a fine-tuned Wav2Vec 2.0 transformer.
-2. **Branch B (Biomechanical & Spectral Acoustics):** Measures physical vocal tract kinematics (jitter, shimmer, harmonics-to-noise ratio, formants, and spectral flux) via Praat Parselmouth.
-3. **Branch C (Probabilistic Fusion & Temporal Smoothing):** Combines neural and acoustic probabilities through a calibrated meta-classifier, smoothed across consecutive time windows to prevent erratic flickering.
+1. **Branch A (Deep Neural Embeddings):** Captures high-level latent representations and neural vocoder artifacts using a pretrained, frozen Wav2Vec 2.0 transformer feeding into an XGBoost classifier.
+2. **Branch B (Statistical Acoustic & Spectral Features):** Computes statistical spectral features (MFCC, spectral centroid, ZCR, etc.) via an XGBoost classifier. Praat Parselmouth additionally extracts vocal biomarkers (pitch, jitter, shimmer, HNR) for dashboard telemetry only — these are not classifier inputs.
+3. **Branch C (Probabilistic Fusion & Temporal Smoothing):** Combines Branch A and Branch B probabilities through a calibrated Logistic Regression meta-classifier, then applies Exponential Moving Average (EMA) smoothing across consecutive windows to yield a single authoritative verdict.
 
 ---
 
@@ -180,7 +180,7 @@ d:\SIH FINAL\
 The brain of the system. Contains the `WaveSpectrumDetector` and `TemporalSmoother` classes.
 
 * **Branch A (Wav2Vec 2.0 + XGBoost):**
-  * *Architecture:* Pretrained `facebook/wav2vec2-base` (loaded via safe, zero-copy safetensors) extracts 768-dimensional latent representations.
+  * *Architecture:* Pretrained, frozen `facebook/wav2vec2-base` (loaded via safe, zero-copy safetensors) extracts 768-dimensional latent representations. Weights are not updated — the model serves as a fixed feature extractor.
   * *Classifier:* A gradient-boosted decision tree (`model_a_branch_a.json`) trained to identify subtle mathematical artifacts left by neural vocoders (like HiFi-GAN, WaveGlow).
 * **Branch B (Acoustic & Spectral ML Features):**
   * *ML Inputs:* Statistical spectral and acoustic features including MFCC mean/std, spectral centroid, bandwidth, spectral rolloff, spectral flux, RMS, and Zero Crossing Rate (ZCR).
@@ -208,20 +208,33 @@ Stores the detailed forensic analysis for each processed audio window.
 | `session_id` | String | Unique UUID for the call/session |
 | `chunk_id` | Integer | Sequential audio chunk index |
 | `timestamp` | DateTime | Timestamp when window was evaluated |
-| `verdict` | String | `"HUMAN"` or `"AI"` |
-| `confidence` | Double | Confidence level (0.0 to 1.0) |
-| `p_fake` | Double | Raw probability of synthetic speech |
+| `verdict` | String | Authoritative verdict: `"HUMAN"`, `"AI"`, or `"UNCERTAIN"` (derived from smoothed_p_fake) |
+| `confidence` | Double | Confidence score derived from smoothed_p_fake (0.0 to 1.0) |
+| `p_fake` | Double | Raw probability of synthetic speech from fusion model |
+| `smoothed_p_fake` | Double | Temporally smoothed probability (EMA output) |
+| `windows_seen` | Integer | Number of windows seen by EMA at this point |
 | `p_a` | Double | Probability score from Branch A |
 | `p_b` | Double | Probability score from Branch B |
 | `processing_time_ms` | Double | End-to-end inference latency |
 | `branch_timing` | Object | Latency breakdown for models A, B, and C |
-| `acoustic_features` | Object | Pitch ($F_0$), Jitter, Shimmer, HNR, Spectral Centroid |
-| `temporal_smoothing` | Object | Smoothed score and windows counter |
+| `acoustic_features` | Object | Pitch ($F_0$), Jitter, Shimmer, HNR, Spectral Centroid (dashboard telemetry only) |
 
 * **Indexes:** `{ session_id: 1, chunk_id: 1 }` (compound), `{ session_id: 1 }`.
 
 ### Collection 2: `sessions`
-Stores session metadata, start/end times, and cumulative aggregate verdicts for compliance auditing.
+Stores session metadata, start/end times, and the authoritative aggregated final verdict.
+
+| Field | Type | Description |
+|---|---|---|
+| `_id` | ObjectId | MongoDB unique identifier |
+| `session_id` | String | Unique UUID for the call/session (unique index) |
+| `start_time` | DateTime | Timestamp when the WebSocket connected |
+| `end_time` | DateTime | Timestamp when the session was finalized |
+| `status` | String | `"in_progress"` or `"completed"` |
+| `source_type` | String | `"websocket_stream"` |
+| `final_verdict` | String | `"HUMAN"`, `"AI"`, or `"UNCERTAIN"` — averaged from `smoothed_p_fake` |
+| `final_p_fake` | Double | Average of per-window `smoothed_p_fake` values |
+| `total_windows` | Integer | Number of inference windows processed |
 
 ### Collection 3: `users`
 Stores user credentials, password hashes with per-user cryptographic salts, and authentication history.

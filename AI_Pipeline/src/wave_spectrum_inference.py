@@ -356,13 +356,22 @@ class TemporalSmoother:
 
     Computes:  S(t) = alpha * P(t) + (1 - alpha) * S(t-1)
 
+    The verdict thresholds (high / low) must be supplied by the caller from
+    the canonical settings object.  This class intentionally has no built-in
+    defaults so that only one source of truth can exist in the system.
+
     alpha: smoothing factor in (0, 1].
            - Higher alpha = more reactive to the latest window.
            - Lower  alpha = smoother, slower to change.
            Default 0.3 is roughly equivalent to a 5-window SMA in responsiveness.
     """
 
-    def __init__(self, alpha: float = 0.3, high: float = 0.75, low: float = 0.35):
+    def __init__(self, alpha: float = 0.3, high: float = None, low: float = None):
+        if high is None or low is None:
+            raise ValueError(
+                "TemporalSmoother requires explicit 'high' and 'low' thresholds. "
+                "Pass them from the canonical settings object."
+            )
         self.alpha         = alpha
         self.high          = high
         self.low           = low
@@ -395,12 +404,11 @@ class TemporalSmoother:
             "verdict"              : verdict,
             "confidence"           : round(confidence, 4),
             "smoothed_p_fake"      : round(smoothed, 4),
-            "moving_average_score" : round(smoothed, 4),  # alias used by frontend
             "uncertain"            : uncertain,
             "windows_seen"         : self._windows_seen,
-            "trend"                : "stable",             # extensible field
         }
 
     def reset(self):
         self._ema          = None
         self._windows_seen = 0
+

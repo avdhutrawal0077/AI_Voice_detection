@@ -16,6 +16,9 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 # Try to import the real pipeline
+_pipeline_available = False
+_pipeline_error: Optional[Exception] = None
+
 try:
     if settings.use_real_pipeline:
         from wave_spectrum_inference import WaveSpectrumDetector, TemporalSmoother
@@ -23,14 +26,13 @@ try:
         _pipeline_available = True
         logger.info("AI Pipeline loaded successfully.")
     else:
-        _pipeline_available = False
-        logger.info("AI Pipeline is disabled in config.")
+        logger.info("AI Pipeline is disabled via use_real_pipeline=False.")
 except ImportError as e:
-    _pipeline_available = False
-    logger.error(f"Failed to import AI Pipeline: {e}. Falling back to mock implementation.")
+    _pipeline_error = e
+    logger.error(f"Failed to import AI Pipeline: {e}")
 except Exception as e:
-    _pipeline_available = False
-    logger.error(f"Error initializing AI Pipeline: {e}. Falling back to mock implementation.")
+    _pipeline_error = e
+    logger.error(f"Error initializing AI Pipeline: {e}")
 
 
 class PipelineService:
@@ -38,10 +40,11 @@ class PipelineService:
     
     @classmethod
     def get_smoother(cls, session_id: str):
-        if not _pipeline_available:
-            return None
         if session_id not in cls._session_smoothers:
-            cls._session_smoothers[session_id] = TemporalSmoother(high=settings.high_threshold, low=settings.low_threshold)
+            cls._session_smoothers[session_id] = TemporalSmoother(
+                high=settings.high_threshold,
+                low=settings.low_threshold
+            )
         return cls._session_smoothers[session_id]
         
     @classmethod
@@ -52,7 +55,14 @@ class PipelineService:
     @classmethod
     def predict(cls, pcm_list: List[float], session_id: str) -> dict:
         if not _pipeline_available:
-            return cls._mock_predict(pcm_list, session_id)
+            # If mock mode is explicitly enabled, use it (development only)
+            if settings.use_mock_pipeline:
+                return cls._mock_predict(pcm_list, session_id)
+            # Otherwise surface the real error — never silently fake results
+            raise RuntimeError(
+                f"Real AI pipeline is unavailable and mock pipeline is disabled. "
+                f"Original error: {_pipeline_error}"
+            )
             
         try:
             # 1. Run inference
