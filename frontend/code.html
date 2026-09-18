@@ -1593,58 +1593,6 @@
                     TrueToneChunkManager._queue.push(chunkMeta);
                 }
 
-                // Send downsampled (if necessary) audio to backend via WebSocket
-                if (window.TrueToneSocket) {
-                    window.TrueToneSocket.sendChunk(chunkMeta.samples, chunkMeta.sampleRate);
-                }
-            };
-
-            // ===================================================================
-            // TrueToneSocket — WebSocket Client for ML Backend Integration
-            // ===================================================================
-            window.TrueToneSocket = {
-                socket: null,
-                _results: [],
-                connect(sessionId) {
-                    this.socket = new WebSocket(`ws://127.0.0.1:8000/ws/audio/${sessionId}`);
-                    this.socket.onmessage = (event) => {
-                        const data = JSON.parse(event.data);
-                        if (data.event === "window_processed") {
-                            this._results.push(data.result);
-                            
-                            // Update UI Live with Acoustic Features
-                            if (data.result.acoustic_features && window.acousticData) {
-                                const af = data.result.acoustic_features;
-                                window.acousticData[0].value = af.pitch_f0_hz;
-                                window.acousticData[1].value = af.speech_rate_syll_per_sec;
-                                window.acousticData[2].value = af.jitter_percent;
-                                window.acousticData[3].value = af.shimmer_percent;
-                                window.acousticData[4].value = af.hnr_db;
-                                window.acousticData[5].value = af.spectral_centroid_hz;
-                                window.acousticData[6].value = af.rms_energy_db;
-                                window.acousticData[7].value = af.pause_ratio_percent;
-                            }
-                        }
-                    };
-                    this.socket.onerror = (e) => console.error("WebSocket Error:", e);
-                },
-                sendChunk(samples, sampleRate) {
-                    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-                        this.socket.send(JSON.stringify({
-                            session_id: window.TrueToneAudio.currentSessionId,
-                            chunk_id: TrueToneChunkManager._nextId,
-                            pcm: Array.from(samples),
-                            sample_rate: sampleRate,
-                            format: "mono_float32"
-                        }));
-                    }
-                },
-                disconnect() {
-                    if (this.socket) {
-                        this.socket.close();
-                        this.socket = null;
-                    }
-                }
             };
 
             // Auto-start when audio pipeline becomes active
@@ -4153,16 +4101,20 @@
                  * Connect to the backend WebSocket.
                  * Creates a unique session ID and opens the connection.
                  */
-                connect() {
+                connect(sessionId) {
                     if (this._ws && this._ws.readyState <= WebSocket.OPEN) {
                         console.warn('[TrueToneSocket] Already connected.');
                         return;
                     }
 
-                    // Generate a unique session ID
-                    const ts = Date.now();
-                    const rand = Math.floor(1000 + Math.random() * 9000);
-                    this._sessionId = `session-${ts}-${rand}`;
+                    // Use supplied session ID or fall back to generating one
+                    if (sessionId) {
+                        this._sessionId = sessionId;
+                    } else {
+                        const ts = Date.now();
+                        const rand = Math.floor(1000 + Math.random() * 9000);
+                        this._sessionId = `session-${ts}-${rand}`;
+                    }
                     this._chunkCounter = 0;
                     this._results = [];
 
@@ -4196,6 +4148,19 @@
                                 window.dispatchEvent(new CustomEvent('truetone-pipeline-result', {
                                     detail: data.result
                                 }));
+
+                                // Update live acoustic metric cards from backend features
+                                if (data.result.acoustic_features && window.acousticData) {
+                                    const af = data.result.acoustic_features;
+                                    window.acousticData[0].value = af.pitch_f0_hz;
+                                    window.acousticData[1].value = af.speech_rate_syll_per_sec;
+                                    window.acousticData[2].value = af.jitter_percent;
+                                    window.acousticData[3].value = af.shimmer_percent;
+                                    window.acousticData[4].value = af.hnr_db;
+                                    window.acousticData[5].value = af.spectral_centroid_hz;
+                                    window.acousticData[6].value = af.rms_energy_db;
+                                    window.acousticData[7].value = af.pause_ratio_percent;
+                                }
                             } else if (data.error) {
                                 console.warn('[TrueToneSocket] Server error:', data.error, data.details);
                             }
@@ -4271,14 +4236,7 @@
                 }
             };
 
-            // Auto-connect when audio pipeline becomes active
-            if (window.TrueToneAudio) {
-                window.TrueToneAudio.onActive(() => {
-                    TrueToneSocket.connect();
-                });
-            }
-
-            // Expose globally
+            // Expose globally — startAnalysis() calls connect(sessionId) directly
             window.TrueToneSocket = TrueToneSocket;
         })();
     </script>

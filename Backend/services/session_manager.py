@@ -21,6 +21,8 @@ class AudioSession:
         self.processed_windows = 0
         self._pcm_buffer: List[float] = []
         self._inference_window_samples = int(settings.inference_window_sec * settings.sample_rate)
+        # Hop = 50% of window → 1 second of new audio triggers the next inference
+        self._inference_hop_samples    = int(settings.hop_duration_sec    * settings.sample_rate)
         
     def add_chunk(self, chunk: AudioChunk) -> bool:
         """
@@ -64,8 +66,9 @@ class AudioSession:
             if len(self._pcm_buffer) >= self._inference_window_samples:
                 # Extract window
                 window_pcm = self._pcm_buffer[:self._inference_window_samples]
-                # Keep remainder
-                self._pcm_buffer = self._pcm_buffer[self._inference_window_samples:]
+                # 50% overlap: advance by hop_samples, retaining the second half
+                # of the current window as context for the next inference window.
+                self._pcm_buffer = self._pcm_buffer[self._inference_hop_samples:]
                 
                 # Run Inference
                 try:

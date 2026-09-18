@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     mongodb_db_name: str = "voice_detection"
     sample_rate: int = 16000
     window_duration_sec: float = 1.0
-    hop_duration_sec: float = 0.5
+    hop_duration_sec: float = 1.0   # 50% overlap: hop = inference_window_sec / 2
     
     # New streaming backend config
     session_timeout_sec: float = 60.0
