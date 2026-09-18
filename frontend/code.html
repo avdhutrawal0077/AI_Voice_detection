@@ -1663,6 +1663,20 @@
                  */
                 _processingChain: Promise.resolve(),
 
+                /**
+                 * Monotonically incrementing session generation counter.
+                 * Incremented by resetState() on every new session.
+                 *
+                 * _processChunk() captures the generation on entry and checks it
+                 * again after every await. If the generation has changed (i.e.
+                 * resetState() was called while this chunk was awaiting ONNX),
+                 * the chunk discards all results without touching _lstmState,
+                 * _contextTail, or the chunk queue. This is the only reliable way
+                 * to prevent Session-A in-flight inference from leaking into Session B,
+                 * because JS Promises cannot be cancelled.
+                 */
+                _sessionGeneration: 0,
+
                 // --- Silero VAD v5 frame parameters ---
                 /** New audio samples per frame (512 at 16kHz = 32ms) */
                 FRAME_NEW_SAMPLES: 512,
@@ -1725,13 +1739,20 @@
 
                         this._modelState = 'ready';
 
-                        // Process any chunks that arrived while model was loading
+                        // Drain chunks that arrived while the model was loading.
+                        // IMPORTANT: route through _processingChain, not direct await.
+                        // Direct await here and chain in classifyChunk() are two separate
+                        // serialisation paths — they would race. By routing pending chunks
+                        // through the same chain, they are guaranteed to run sequentially
+                        // with any classifyChunk() calls that arrived after _modelState='ready'.
                         if (this._pendingChunks.length > 0) {
-                            console.info(`TrueToneSileroVAD: Processing ${this._pendingChunks.length} queued chunk(s).`);
+                            console.info(`TrueToneSileroVAD: Queuing ${this._pendingChunks.length} pre-load chunk(s) onto processing chain.`);
                             const pending = this._pendingChunks;
                             this._pendingChunks = [];
                             for (const chunk of pending) {
-                                await this._processChunk(chunk);
+                                this._processingChain = this._processingChain
+                                    .then(() => this._processChunk(chunk))
+                                    .catch(() => {});
                             }
                         }
 
@@ -1784,6 +1805,16 @@
                  * running inference on each, and deciding speech/silence for the whole chunk.
                  */
                 async _processChunk(chunkMeta) {
+                    // Capture the session generation at the point this chunk begins.
+                    // After every await we verify the generation still matches.
+                    // If resetState() was called while we were inside ONNX inference,
+                    // the generation will have advanced and we silently discard all
+                    // results — state mutations and queue pushes are both skipped.
+                    // This is the only way to prevent in-flight Session-A inference
+                    // from corrupting Session-B state, because JS Promises cannot be
+                    // cancelled once started.
+                    const myGeneration = this._sessionGeneration;
+
                     try {
                         const samples = chunkMeta.samples;
                         if (!samples || samples.length === 0) {
@@ -1791,14 +1822,14 @@
                             return; // drop empty chunk
                         }
 
-                        // Buffer incoming samples
+                        // Buffer incoming samples.
+                        // These mutations happen synchronously (before any await) so
+                        // there is no generation-check needed here.
                         this._sampleBuffer.push(samples);
                         this._bufferedSampleCount += samples.length;
 
                         // We need at least FRAME_NEW_SAMPLES (512) to run one frame
                         if (this._bufferedSampleCount < this.FRAME_NEW_SAMPLES) {
-                            // Not enough samples yet — hold the chunk metadata, it will
-                            // be attributed to the next complete set of frames
                             return;
                         }
 
@@ -1817,6 +1848,19 @@
                             );
 
                             const prob = await this._runFrame(frameSamples);
+
+                            // --- Generation guard (after every await) ---
+                            // resetState() was called while this chunk was inside ONNX inference.
+                            // _lstmState and _contextTail were already zeroed by resetState().
+                            // Discard this chunk entirely — do not push to queue.
+                            if (this._sessionGeneration !== myGeneration) {
+                                console.debug(
+                                    `TrueToneSileroVAD: Discarding stale chunk (gen ${myGeneration} ` +
+                                    `superseded by gen ${this._sessionGeneration}).`
+                                );
+                                return;
+                            }
+
                             if (prob > maxProb) maxProb = prob;
                             frameCount++;
 
@@ -1845,8 +1889,9 @@
                         }
 
                     } catch (err) {
+                        // On error, only pass through if we're still on the same session
+                        if (this._sessionGeneration !== myGeneration) return;
                         console.error('TrueToneSileroVAD: Inference error:', err);
-                        // On error, pass chunk through unfiltered so audio isn't lost
                         chunkMeta.isSpeech = null;
                         chunkMeta.vadError = err.message || String(err);
                         window.TrueToneChunkManager._queue.push(chunkMeta);
@@ -1923,15 +1968,28 @@
                  * Reset LSTM state and context tail (e.g. on new call/session).
                  */
                 resetState() {
+                    // Advance the generation counter FIRST.
+                    // Any _processChunk() that is currently suspended inside
+                    // await this._session.run() will see the changed generation
+                    // when it resumes and will discard its results without touching
+                    // _lstmState, _contextTail, or the chunk queue.
+                    this._sessionGeneration++;
+
+                    // Clear all shared mutable state.
                     this._lstmState.fill(0);
                     this._contextTail.fill(0);
                     this._sampleBuffer = [];
                     this._bufferedSampleCount = 0;
-                    // Reset the processing chain so no in-flight chunks from
-                    // a previous session can bleed into the new one.
-                    this._processingChain = Promise.resolve();
                     this._pendingChunks = [];
-                    console.info('TrueToneSileroVAD: State reset.');
+
+                    // Replace the chain so Session-B chunks start on a clean chain.
+                    // (In-flight Session-A promises already hold a reference to the old
+                    // chain; the generation guard is what actually prevents their results
+                    // from landing — chain replacement just stops new Session-B chunks
+                    // from queuing behind Session-A work.)
+                    this._processingChain = Promise.resolve();
+
+                    console.info(`TrueToneSileroVAD: State reset (generation=${this._sessionGeneration}).`);
                 }
             };
 
