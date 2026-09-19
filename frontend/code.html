@@ -1287,6 +1287,11 @@
                         window.TrueToneState = window.TrueToneState || {};
                         window.TrueToneState.analysisActive = true;
 
+                        // Start ChunkManager listener for this session
+                        if (window.TrueToneChunkManager) {
+                            window.TrueToneChunkManager.start();
+                        }
+
                         // Reset button state
                         if (startBtn) {
                             startBtn.disabled = false;
@@ -1691,10 +1696,7 @@
 
             };
 
-            // Auto-start when audio pipeline becomes active
-            TrueToneAudio.onActive(() => {
-                TrueToneChunkManager.start();
-            });
+
 
             // Expose globally
             window.TrueToneChunkManager = TrueToneChunkManager;
