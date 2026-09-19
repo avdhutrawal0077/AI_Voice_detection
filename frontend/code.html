@@ -1267,7 +1267,7 @@
                         }
                         if (window.TrueToneChunkManager) {
                             window.TrueToneChunkManager.clear();
-                            window.TrueToneChunkManager._nextId = 0;
+                            window.TrueToneChunkManager._nextId = 1;
                         }
 
                         // --- AudioWorklet: load chunk processor and connect ---
@@ -1474,8 +1474,10 @@
                 /** @type {Array<Object>} In-memory queue of chunk-metadata objects */
                 _queue: [],
 
-                /** Auto-incrementing counter for unique chunk IDs */
-                _nextId: 0,
+                /** Auto-incrementing counter for unique chunk IDs.
+                 * Starts at 1 (not 0) to match the backend's expected_chunk_id=1 contract.
+                 * Reset to 1 (not 0) at the start of each new session in startAnalysis(). */
+                _nextId: 1,
 
                 /** Whether the manager is actively listening */
                 _listening: false,
@@ -1847,19 +1849,15 @@
                                 frameOffset + this.FRAME_NEW_SAMPLES
                             );
 
-                            const prob = await this._runFrame(frameSamples);
+                            // Pass myGeneration into _runFrame so it can guard state
+                            // mutations INSIDE the function, before returning. This closes
+                            // the window where ONNX finishes and commits _lstmState /
+                            // _contextTail after resetState() has already cleared them.
+                            const prob = await this._runFrame(frameSamples, myGeneration);
 
-                            // --- Generation guard (after every await) ---
-                            // resetState() was called while this chunk was inside ONNX inference.
-                            // _lstmState and _contextTail were already zeroed by resetState().
-                            // Discard this chunk entirely — do not push to queue.
-                            if (this._sessionGeneration !== myGeneration) {
-                                console.debug(
-                                    `TrueToneSileroVAD: Discarding stale chunk (gen ${myGeneration} ` +
-                                    `superseded by gen ${this._sessionGeneration}).`
-                                );
-                                return;
-                            }
+                            // null means _runFrame detected a generation mismatch AFTER the
+                            // ONNX await and skipped all state mutations. Bail out now.
+                            if (prob === null) return;
 
                             if (prob > maxProb) maxProb = prob;
                             frameCount++;
@@ -1905,17 +1903,31 @@
                  * @param {Float32Array} newSamples — exactly 512 samples
                  * @returns {Promise<number>} speech probability [0..1]
                  */
-                async _runFrame(newSamples) {
+                /**
+                 * Run Silero VAD inference on a single 512-sample frame.
+                 * Handles the 64-sample rolling context and LSTM state threading.
+                 *
+                 * @param {Float32Array} newSamples   — exactly 512 samples
+                 * @param {number}       myGeneration — session generation captured by caller.
+                 *   Checked BEFORE committing _lstmState / _contextTail mutations.
+                 *   If the generation has advanced (resetState() fired during ONNX),
+                 *   state mutations are skipped and null is returned so the caller
+                 *   can bail out immediately.
+                 * @returns {Promise<number|null>} speech probability [0..1], or null if stale
+                 */
+                async _runFrame(newSamples, myGeneration) {
                     // Build the 576-sample input: [64 context | 512 new]
+                    // Reading _contextTail here is safe — it is a synchronous read
+                    // before any await, so no generation check needed yet.
                     const inputData = new Float32Array(this.FRAME_TOTAL_SAMPLES);
                     inputData.set(this._contextTail, 0);
                     inputData.set(newSamples, this.FRAME_CONTEXT_SAMPLES);
 
-                    // Prepare ONNX tensors
+                    // Prepare ONNX tensors.
+                    // _lstmState.slice() makes a copy, so the tensor is not affected
+                    // by a concurrent resetState() call during inference.
                     // TODO: Verify tensor names ("input", "state", "sr") against your specific
-                    // model file by checking session.inputNames at load time. The names below
-                    // are from Silero VAD v5 (snakers4/silero-vad). Older versions or custom
-                    // exports may use different names.
+                    // model file by checking session.inputNames at load time.
                     const inputTensor = new ort.Tensor('float32', inputData, [1, this.FRAME_TOTAL_SAMPLES]);
                     const stateTensor = new ort.Tensor('float32', this._lstmState.slice(), [2, 1, 128]);
                     const srTensor = new ort.Tensor('int64', new BigInt64Array([16000n]), [1]);
@@ -1930,7 +1942,22 @@
                     // specific model file by checking session.outputNames at load time.
                     const results = await this._session.run(feeds);
 
-                    // Extract speech probability
+                    // ── Generation guard — MUST happen before ANY state mutation ──────────
+                    // If resetState() fired while ONNX was running:
+                    //   • _lstmState was zeroed by resetState() — the new state we just
+                    //     computed is stale and must NOT be committed.
+                    //   • _contextTail was zeroed by resetState() — same reason.
+                    //   • Writing them now would corrupt Session-B's clean starting state.
+                    // Returning null signals the caller to bail without touching the queue.
+                    if (this._sessionGeneration !== myGeneration) {
+                        console.debug(
+                            `TrueToneSileroVAD: Discarding stale frame result ` +
+                            `(gen ${myGeneration} superseded by gen ${this._sessionGeneration}).`
+                        );
+                        return null;
+                    }
+
+                    // Generation still matches — safe to commit state mutations.
                     const prob = results['output'].data[0];
 
                     // Update LSTM state for next frame
