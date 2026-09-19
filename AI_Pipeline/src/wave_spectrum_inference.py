@@ -268,7 +268,8 @@ class WaveSpectrumDetector:
             )
 
             # ── 5. Pitch F0 (Hz) ───────────────────────────────────────────
-            pitch        = call(sound, "To Pitch", 0.0, 75, 500)
+            # Use trimmed sound to prevent zero-padding from skewing pitch estimation
+            pitch        = call(sound_trimmed, "To Pitch", 0.0, 75, 500)
             pitch_values = [
                 pitch.get_value_at_time(pitch.xs()[i])
                 for i in range(len(pitch.xs()))
@@ -282,7 +283,7 @@ class WaveSpectrumDetector:
 
             # ── 6. Jitter (%) ──────────────────────────────────────────────
             point_process = call(
-                sound, "To PointProcess (periodic, cc)", 75, 500)
+                sound_trimmed, "To PointProcess (periodic, cc)", 75, 500)
             n_points = call(point_process, "Get number of points")
 
             jitter = call(
@@ -296,7 +297,7 @@ class WaveSpectrumDetector:
             # parselmouth returns local shimmer as ratio (0.23 = 23%)
             # Only reliable with enough voiced periods
             shimmer = call(
-                [sound, point_process],
+                [sound_trimmed, point_process],
                 "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
             features['shimmer_percent'] = round(
                 float(shimmer) * 100

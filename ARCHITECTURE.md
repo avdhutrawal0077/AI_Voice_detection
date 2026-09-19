@@ -4,10 +4,10 @@
 
 **True Tone** is a real-time, multi-branch artificial intelligence system designed to detect synthesized, cloned, and deepfake human speech during live audio streams (such as phone calls, video conferences, or live recordings).
 
-Detecting modern AI voice cloning requires more than simple spectral analysis. State-of-the-art text-to-speech (TTS) and voice conversion (VC) models (e.g., ElevenLabs, XTTS, VITS) replicate human pitch and timbre with extreme fidelity. To counter this, True Tone uses a **tri-branch ensemble architecture**:
+Detecting modern AI voice cloning requires more than simple spectral analysis. State-of-the-art text-to-speech (TTS) and voice conversion (VC) models (e.g., ElevenLabs, XTTS, VITS) replicate human pitch and timbre with extreme fidelity. To counter this, True Tone uses a **two-branch pipeline with a fusion meta-classifier**:
 1. **Branch A (Deep Neural Embeddings):** Captures high-level latent representations and neural vocoder artifacts using a pretrained, frozen Wav2Vec 2.0 transformer feeding into an XGBoost classifier.
 2. **Branch B (Statistical Acoustic & Spectral Features):** Computes statistical spectral features (MFCC, spectral centroid, ZCR, etc.) via an XGBoost classifier. Praat Parselmouth additionally extracts vocal biomarkers (pitch, jitter, shimmer, HNR) for dashboard telemetry only — these are not classifier inputs.
-3. **Branch C (Probabilistic Fusion & Temporal Smoothing):** Combines Branch A and Branch B probabilities through a calibrated Logistic Regression meta-classifier, then applies Exponential Moving Average (EMA) smoothing across consecutive windows to yield a single authoritative verdict.
+3. **Fusion & Temporal Smoothing:** Combines Branch A and Branch B probabilities through a calibrated Logistic Regression meta-classifier, then applies Exponential Moving Average (EMA) smoothing across consecutive windows to yield a single authoritative verdict.
 
 ---
 
@@ -18,8 +18,8 @@ flowchart TD
     subgraph Client ["Client Browser (Frontend)"]
         MIC[Microphone Input 16kHz] --> AW[AudioWorklet: audio-chunk-processor.js]
         AW --> VAD[Silero VAD v5 ONNX Engine]
-        VAD -->|Voice Active Chunks| WSClient[WebSocket Streaming Engine]
-        VAD -.->|Silence Dropped| DROP((Dropped))
+        VAD -->|Voice Activity Metadata| WSClient[WebSocket Streaming Engine]
+        VAD -.->|All PCM Chunks Preserved| WSClient
         WSClient --> UI[Three.js Waveform & Real-Time Gauges]
     end
 
@@ -33,10 +33,10 @@ flowchart TD
         BUF --> Bridge[services/ai_pipeline.py]
         Bridge --> INFER[wave_spectrum_inference.py]
         
-        subgraph Ensemble ["Tri-Branch Detection Engine"]
+        subgraph Ensemble ["Two-Branch Detection Engine"]
             INFER --> BranchA["Branch A: Wav2Vec2 + XGBoost (Deep Neural Latents)"]
             INFER --> BranchB["Branch B: Praat Acoustic + Mel/MFCC Scaler + XGBoost"]
-            BranchA --> Fusion["Branch C: Logistic Regression Meta-Classifier"]
+            BranchA --> Fusion["Fusion: Logistic Regression Meta-Classifier"]
             BranchB --> Fusion
         end
 

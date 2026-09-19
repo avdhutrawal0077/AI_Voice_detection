@@ -18,8 +18,10 @@ class InferenceEngine:
         # Convert np.ndarray to list of floats for the pipeline
         pcm_list = audio_window.tolist()
         
-        # Call the PipelineService
-        result_dict = PipelineService.predict(pcm_list, session_id)
+        # Offload CPU/GPU inference to a worker thread so we don't block the FastAPI event loop.
+        # This allows the WebSocket to continue handling ping/pong and END_SESSION messages.
+        import asyncio
+        result_dict = await asyncio.to_thread(PipelineService.predict, pcm_list, session_id)
         
         # Parse into PipelineResponse
         return PipelineResponse(**result_dict)
