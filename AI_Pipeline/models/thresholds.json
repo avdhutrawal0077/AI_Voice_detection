@@ -1,0 +1,9 @@
+{
+  "high_threshold": 0.7100000000000004,
+  "low_threshold": 0.2899999999999996,
+  "description": {
+    "above_high": "AI \u2014 high confidence fake",
+    "below_low": "HUMAN \u2014 high confidence real",
+    "between": "UNCERTAIN \u2014 insufficient evidence"
+  }
+}
