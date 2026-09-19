@@ -667,8 +667,6 @@
                     <div id="login-password-error" class="login-error-msg" role="alert" aria-live="polite"></div>
                 </div>
 
-                <!-- Forgot Password -->
-                <a href="#" class="login-forgot" id="login-forgot-link">Forgot Password?</a>
 
                 <!-- Submit Button -->
                 <button type="submit" class="login-btn" id="login-submit-btn">
@@ -1479,21 +1477,16 @@
             window.navigateToDashboard = navigateToDashboard;
 
             /**
-             * Completely stops the audio pipeline, tears down the worklet, and suspends the context.
-             * This must be called at the end of a session to prevent orphaned background processing.
+             * Phase 1 of shutdown: Stops the physical microphone capture and disconnects
+             * the worklet node so no new audio can enter the pipeline.
              */
-            window.stopAudioPipeline = function() {
-                console.info('[TrueToneAudio] Stopping audio pipeline...');
-
-                // 1. Stop ChunkManager and VAD
-                if (window.TrueToneChunkManager && typeof window.TrueToneChunkManager.stop === 'function') {
-                    window.TrueToneChunkManager.stop();
-                }
+            window.stopAudioCapture = function() {
+                console.info('[TrueToneAudio] Phase 1: Stopping audio capture...');
 
                 if (window.TrueToneAudio) {
                     const t = window.TrueToneAudio;
 
-                    // 2. Disconnect and tear down the worklet node
+                    // 1. Disconnect and tear down the worklet node
                     if (t.chunkWorkletNode) {
                         try {
                             if (t.sourceNode) t.sourceNode.disconnect(t.chunkWorkletNode);
@@ -1505,7 +1498,7 @@
                         t.chunkWorkletNode = null;
                     }
 
-                    // 3. Disconnect source node from everything
+                    // 2. Disconnect source node from everything
                     if (t.sourceNode) {
                         try {
                             t.sourceNode.disconnect();
@@ -1513,26 +1506,32 @@
                         t.sourceNode = null;
                     }
 
-                    // 4. Stop microphone tracks
+                    // 3. Stop microphone tracks
                     if (t.stream) {
                         t.stream.getTracks().forEach(track => {
                             track.stop();
-                            // If it's a mock stream, it might have a close() method
                             if (typeof track.close === 'function') track.close();
                         });
                         t.stream = null;
                     }
+                }
+                console.info('[TrueToneAudio] Capture stopped.');
+            };
 
-                    // 5. Suspend the audio context (do not close it, to avoid re-prompting for mic access)
+            /**
+             * Phase 3 of shutdown: Suspends the audio context and resets state.
+             * Must be called AFTER the session has been finalized.
+             */
+            window.cleanupAudioPipeline = function() {
+                console.info('[TrueToneAudio] Phase 3: Cleaning up audio pipeline...');
+                if (window.TrueToneAudio) {
+                    const t = window.TrueToneAudio;
                     if (t.audioCtx && t.audioCtx.state !== 'closed') {
                         t.audioCtx.suspend().catch(e => console.warn('[TrueToneAudio] Failed to suspend context:', e));
                     }
-
-                    // 6. Reset state
                     t.state = 'idle';
                 }
-
-                console.info('[TrueToneAudio] Pipeline stopped successfully.');
+                console.info('[TrueToneAudio] Pipeline cleanup complete.');
             };
 
             // ===================================================================
@@ -1563,13 +1562,18 @@
                 },
 
                 /**
-                 * Stop listening (e.g. on session end). Does NOT drain the queue.
+                 * Stop listening for new microphone chunks, and await any in-flight VAD inference.
+                 * Does NOT drain the queue.
                  */
-                stop() {
+                async stop() {
                     if (!this._listening) return;
                     window.removeEventListener('truetone-audio-chunk', this._handleChunk);
                     this._listening = false;
-                    console.info('TrueToneChunkManager: Stopped listening.');
+                    console.info('TrueToneChunkManager: Stopped listening for new chunks.');
+
+                    if (window.TrueToneSileroVAD && typeof window.TrueToneSileroVAD.flush === 'function') {
+                        await window.TrueToneSileroVAD.flush();
+                    }
                 },
 
                 /**
@@ -2125,6 +2129,22 @@
                     this._processingChain = Promise.resolve();
 
                     console.info(`TrueToneSileroVAD: State reset (generation=${this._sessionGeneration}).`);
+                },
+
+                /**
+                 * Awaits all pending chunks currently inside the _processingChain.
+                 * Must be called after detaching the microphone so no new chunks can enter,
+                 * ensuring the VAD pipeline completely drains before finalization.
+                 * @returns {Promise<void>}
+                 */
+                async flush() {
+                    console.info('TrueToneSileroVAD: Flushing processing chain...');
+                    try {
+                        await this._processingChain;
+                    } catch (err) {
+                        console.warn('TrueToneSileroVAD: Error during flush:', err);
+                    }
+                    console.info('TrueToneSileroVAD: Flush complete.');
                 }
             };
 
@@ -3548,13 +3568,25 @@
 
                 const socket = window.TrueToneSocket;
 
-                // ── Step 1: Stop chunk sending and request the authoritative verdict ──
-                // endSession() sends END_SESSION to the backend and waits (up to 5 s) for
-                // the FINAL_RESULT message. The socket stays open until the response arrives.
+                // ── Phase 1: Stop Capture ───────────────────────────────────────────
+                // Instantly stop the microphone and disconnect the AudioWorklet.
+                // This guarantees no *new* audio chunks will enter the ChunkManager.
+                if (typeof window.stopAudioCapture === 'function') {
+                    window.stopAudioCapture();
+                }
+
+                // ── Phase 2: Finalize ───────────────────────────────────────────────
+                // Stop the ChunkManager listener and await any chunks currently processing
+                // inside the VAD's ONNX runtime. This drains the pipeline.
+                if (window.TrueToneChunkManager && typeof window.TrueToneChunkManager.stop === 'function') {
+                    await window.TrueToneChunkManager.stop();
+                }
+
+                // endSession() will now synchronously drain whatever is left in the queue,
+                // send the END_SESSION control message, and wait up to 15s for FINAL_RESULT.
                 let finalResult = null;
                 if (socket) {
-                    finalResult = await socket.endSession(5000);
-                    socket.disconnect();
+                    finalResult = await socket.endSession(15000); // 15-second timeout for ML inference
                 }
 
                 // ── Step 2: Classify pipeline availability ──────────────────────────
@@ -3706,9 +3738,13 @@
                 // Save to History
                 HistoryStore.save(session);
 
-                // Stop microphone tracks and full audio pipeline
-                if (typeof window.stopAudioPipeline === 'function') {
-                    window.stopAudioPipeline();
+                // ── Phase 3: Cleanup ────────────────────────────────────────────────
+                // Disconnect WebSocket and suspend the AudioContext.
+                if (socket) {
+                    socket.disconnect();
+                }
+                if (typeof window.cleanupAudioPipeline === 'function') {
+                    window.cleanupAudioPipeline();
                 }
 
                 // Navigate from Analysis Dashboard back to Start Screen

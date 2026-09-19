@@ -11,10 +11,6 @@ from db.database import get_db
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-MAX_PENDING_CHUNKS  = 50    # Reject any chunk that would exceed this in-flight buffer
-MAX_CHUNK_ID_GAP    = 100   # Reject chunk IDs more than this far ahead of expected
-MAX_PCM_BUFFER_SEC  = 30    # Maximum audio buffered before trimming (in seconds)
 
 
 class AudioSession:
@@ -30,7 +26,7 @@ class AudioSession:
         self._pcm_buffer: List[float] = []
         self._inference_window_samples = int(settings.inference_window_sec * settings.sample_rate)
         self._inference_hop_samples    = int(settings.hop_duration_sec    * settings.sample_rate)
-        self._max_pcm_buffer_samples   = int(MAX_PCM_BUFFER_SEC * settings.sample_rate)
+        self._max_pcm_buffer_samples   = int(settings.max_pcm_buffer_sec * settings.sample_rate)
 
         # Per-session lock: prevents process_ready_chunks() from being called concurrently
         # (e.g. if two WebSocket connections somehow share the same session object).
@@ -57,15 +53,15 @@ class AudioSession:
             if gap > MAX_CHUNK_ID_GAP:
                 logger.warning(
                     f"Session {self.session_id}: Chunk ID {chunk.chunk_id} is "
-                    f"{gap} ahead of expected {self.expected_chunk_id} (gap > {MAX_CHUNK_ID_GAP}). "
+                    f"{gap} ahead of expected {self.expected_chunk_id} (gap > {settings.max_chunk_id_gap}). "
                     f"Rejecting to prevent memory exhaustion."
                 )
                 return False
-            if len(self.pending_chunks) >= MAX_PENDING_CHUNKS:
+            if len(self.pending_chunks) >= settings.max_pending_chunks:
                 # Evict the lowest pending chunk ID to make room
                 oldest_id = min(self.pending_chunks.keys())
                 logger.warning(
-                    f"Session {self.session_id}: Pending chunk buffer full ({MAX_PENDING_CHUNKS}). "
+                    f"Session {self.session_id}: Pending chunk buffer full ({settings.max_pending_chunks}). "
                     f"Evicting oldest pending chunk {oldest_id}."
                 )
                 self.pending_chunks.pop(oldest_id)
@@ -95,11 +91,18 @@ class AudioSession:
 
     # ── Inference ──────────────────────────────────────────────────────────────
 
+    async def add_and_process_chunk(self, chunk: AudioChunk) -> List[StreamResponse]:
+        """
+        Atomically adds a chunk to the queue and triggers processing.
+        Protected by a per-session asyncio.Lock to prevent concurrent mutation.
+        """
+        async with self._lock:
+            self.add_chunk(chunk)
+            return await self._process_ready_chunks_locked()
+
     async def process_ready_chunks(self) -> List[StreamResponse]:
         """
-        Drains ready_chunks into the PCM buffer and triggers ML inference once a
-        full window is accumulated. Protected by a per-session asyncio.Lock to
-        prevent concurrent mutation of _pcm_buffer and processed_windows.
+        Legacy entrypoint. Prefer add_and_process_chunk for atomic ingestion.
         """
         async with self._lock:
             return await self._process_ready_chunks_locked()
@@ -115,7 +118,7 @@ class AudioSession:
                 excess = (len(self._pcm_buffer) + len(incoming)) - self._max_pcm_buffer_samples
                 logger.error(
                     f"Session {self.session_id}: PCM buffer would exceed "
-                    f"{MAX_PCM_BUFFER_SEC}s limit. Trimming {excess} oldest samples."
+                    f"{settings.max_pcm_buffer_sec}s limit. Trimming {excess} oldest samples."
                 )
                 self._pcm_buffer = self._pcm_buffer[excess:]
 

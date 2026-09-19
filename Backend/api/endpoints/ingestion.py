@@ -92,8 +92,8 @@ async def websocket_audio(websocket: WebSocket, session_id: str):
                 await _send_error(websocket, session_id, "Session ID mismatch in payload")
                 continue
 
-            session.add_chunk(chunk)
-            responses = await session.process_ready_chunks()
+            # Atomically enqueue and process the chunk under a single session lock
+            responses = await session.add_and_process_chunk(chunk)
             for response in responses:
                 await websocket.send_text(response.model_dump_json())
 
