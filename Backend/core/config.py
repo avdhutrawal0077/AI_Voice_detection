@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List
+from typing import List, Optional
 
 class Settings(BaseSettings):
     app_name: str = "Voice Integrity Verification API"
@@ -29,8 +29,15 @@ class Settings(BaseSettings):
 
     # ── Session Config ─────────────────────────────────────────────────────
     session_timeout_sec:      float      = 60.0
-    max_pcm_size_elements:    int        = 160000  # max 10 sec at 16kHz
+    max_pcm_size_elements:    int        = 160000  # max 10 sec at 16kHz per chunk
+    max_pcm_buffer_sec:       float      = 30.0    # max total PCM buffered per session
+    max_pending_chunks:       int        = 50      # max out-of-order chunks held in memory
+    max_chunk_id_gap:         int        = 100     # max accepted gap between chunk IDs
     allowed_audio_formats:    List[str]  = ["mono_float32"]
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    # Set to specific origins in production via .env: CORS_ORIGINS=["https://yourdomain.com"]
+    cors_origins:             List[str]  = ["*"]
 
     # ── AI Pipeline Path ───────────────────────────────────────────────────
     ai_pipeline_dir:  str  = "../AI_Pipeline"

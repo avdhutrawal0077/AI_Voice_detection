@@ -24,11 +24,13 @@ class AuthResponse(BaseModel):
 def hash_password(password: str, salt: str = None) -> tuple[str, str]:
     if salt is None:
         salt = secrets.token_hex(16)
+    # OWASP 2024 guidance: PBKDF2-HMAC-SHA256 with ≥ 600,000 iterations.
+    # Preferred for new systems: Argon2id (not yet in stdlib; would require argon2-cffi).
     pw_hash = hashlib.pbkdf2_hmac(
         'sha256',
         password.encode('utf-8'),
         salt.encode('utf-8'),
-        iterations=100000
+        iterations=600_000
     ).hex()
     return pw_hash, salt
 

@@ -86,6 +86,19 @@ class WaveSpectrumDetector:
         self._pre_cfg = pre_cfg
 
     def preprocess(self, pcm_input):
+        """
+        Convert raw PCM to a fixed-length tensor ready for branch inference.
+
+        Training assumptions (must match):
+          - sample_rate  : 16,000 Hz  (TARGET_SR)
+          - input_length : 4.0 sec    = 64,000 samples  (TARGET_SAMPLES)
+          - padding      : zero-pad short inputs; truncate long inputs
+          - normalisation: peak-normalise so max(|x|) = 1.0
+
+        If the backend is configured for a different sample rate or window
+        size, the model will produce meaningless outputs.  The assertion
+        below will catch this at runtime.
+        """
         audio = torch.tensor(
             np.array(pcm_input, dtype=np.float32)).unsqueeze(0)
         peak  = audio.abs().max()
@@ -96,6 +109,16 @@ class WaveSpectrumDetector:
                 audio, (0, TARGET_SAMPLES - audio.shape[1]))
         else:
             audio = audio[:, :TARGET_SAMPLES]
+
+        # Verify the output shape matches training expectations.
+        # If this assertion fires, check that:
+        #   (a) TARGET_SAMPLES = 64000 (4 s * 16 kHz) in this file, and
+        #   (b) inference_window_sec in backend config.py is 2.0 s.
+        assert audio.shape == (1, TARGET_SAMPLES), (
+            f"Preprocessing produced shape {tuple(audio.shape)}; "
+            f"expected (1, {TARGET_SAMPLES}). "
+            f"Check TARGET_SAMPLES ({TARGET_SAMPLES}) and input length."
+        )
         return audio.to(DEVICE)
 
     def extract_branch_a(self, audio):

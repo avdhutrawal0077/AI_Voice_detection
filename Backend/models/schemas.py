@@ -47,15 +47,18 @@ class AnalysisResponse(BaseModel):
     final_risk_score: Optional[float]
     windows: List[WindowResultResponse]
 
-# New Streaming Backend Schemas
+# ── Streaming Backend Schemas ─────────────────────────────────────────────────
 from core.config import settings
 
 class AudioChunk(BaseModel):
     session_id: str = Field(..., description="Unique identifier for the session")
-    chunk_id: int = Field(..., description="Sequential chunk ID to track order")
+    chunk_id: int = Field(..., description="Sequential chunk ID to track order (starts at 1)")
     pcm: List[float] = Field(..., description="Audio samples as float32 array")
-    sample_rate: int = Field(..., description="Sample rate (e.g., 16000)")
+    sample_rate: int = Field(..., description="Sample rate — must be 16000 Hz")
     format: str = Field(..., description="Audio format (e.g., mono_float32)")
+    # VAD metadata: true=speech, false=silence, null=VAD unavailable.
+    # All chunks (speech and silence) are sent; this field is informational only.
+    is_speech: Optional[bool] = Field(None, description="Silero VAD classification for this chunk")
 
     @field_validator('sample_rate')
     @classmethod
@@ -116,9 +119,24 @@ class StreamResponse(BaseModel):
     timestamp: datetime
     status: str
 
+class FinalResultResponse(BaseModel):
+    """
+    Sent by the backend in response to an END_SESSION control message.
+    This is the single authoritative result for the session — the frontend
+    must use this (not the last streaming window result) for the final report.
+    """
+    session_id: str
+    event: str = "final_result"
+    verdict: str = Field(..., description="HUMAN | AI | UNCERTAIN")
+    p_fake: float = Field(..., description="Average smoothed_p_fake across all windows")
+    confidence: float = Field(..., description="Final confidence (=p_fake for AI, =1-p_fake for HUMAN)")
+    total_windows: int
+    windows_failed: int = 0
+    timestamp: datetime
+
 class SessionSummaryResponse(BaseModel):
     session_id: str
-    total_chunks: int
+    total_windows: int          # was total_chunks — renamed to be consistent
     final_verdict: str
     average_confidence: float
     timestamps: List[float]

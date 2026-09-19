@@ -42,7 +42,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Permissive for local dev
+    # Configured via settings.cors_origins (default ["*"] for local dev).
+    # Override in .env: CORS_ORIGINS=["https://your-frontend.com"]
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

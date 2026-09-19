@@ -1147,7 +1147,11 @@
                         try {
                             this.audioCtx = new AudioContextClass({ sampleRate: 16000 });
                         } catch (ctxErr) {
-                            console.warn('TrueTone: AudioContext rejected sampleRate: 16000, falling back to default rate. Downstream resampling will be needed.', ctxErr);
+                            console.warn(
+                                'TrueTone: AudioContext rejected sampleRate: 16000, falling back to native rate. ' +
+                                'The AudioWorklet resampler will resample output to 16 kHz before sending chunks.',
+                                ctxErr
+                            );
                             this.audioCtx = new AudioContextClass();
                         }
                     }
@@ -1203,9 +1207,13 @@
                         if (!this.audioCtx || this.audioCtx.state === 'closed') {
                             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
                             try {
-                                this.audioCtx = new AudioContextClass({ sampleRate: 16000 });
+                            this.audioCtx = new AudioContextClass({ sampleRate: 16000 });
                             } catch (ctxErr) {
-                                console.warn('TrueTone: AudioContext rejected sampleRate: 16000, falling back to default rate. Downstream resampling will be needed.', ctxErr);
+                                console.warn(
+                                    'TrueTone: AudioContext rejected sampleRate: 16000, falling back to native rate. ' +
+                                    'The AudioWorklet resampler will resample output to 16 kHz before sending chunks.',
+                                    ctxErr
+                                );
                                 this.audioCtx = new AudioContextClass();
                             }
                         }
@@ -1235,9 +1243,10 @@
                         );
 
                         if (this.actualSampleRate !== 16000) {
-                            console.warn(
-                                `TrueTone: AudioContext is running at ${this.actualSampleRate} Hz instead of the requested 16000 Hz. ` +
-                                `Downstream resampling will be needed before passing audio to any 16 kHz model.`
+                            console.info(
+                                `TrueTone: AudioContext is running at ${this.actualSampleRate} Hz (native). ` +
+                                `The AudioWorklet resampler converts all output to 16 kHz PCM before chunking. ` +
+                                `Backend will receive 16000 Hz audio regardless.`
                             );
                         }
                         if (this.actualChannelCount !== null && this.actualChannelCount !== 1) {
@@ -1549,7 +1558,13 @@
                 if (!detail) return;
 
                 const audio = window.TrueToneAudio;
-                const sampleRate = (audio && audio.actualSampleRate) || detail.sampleRate;
+                // The sampleRate MUST come from detail.sampleRate — that is the rate of the
+                // actual PCM samples being emitted by the AudioWorklet resampler (always 16000).
+                // audio.actualSampleRate is the native AudioContext rate (e.g. 48000) and
+                // MUST NOT be used here: it would cause the backend to receive a wrong sample_rate
+                // field and reject the chunk with a 422 validation error on browsers that run at
+                // a native rate other than 16 kHz.
+                const sampleRate = detail.sampleRate;   // always 16000 — from worklet resampler
                 const channelCount = (audio && audio.actualChannelCount) || 1;
                 const sampleCount = detail.sampleCount;
 
@@ -1734,10 +1749,34 @@
                             executionProviders: ['wasm']
                         });
 
-                        // Log actual tensor names for verification
-                        console.info('TrueToneSileroVAD: Model loaded successfully.');
-                        console.info('  inputNames:', this._session.inputNames);
-                        console.info('  outputNames:', this._session.outputNames);
+                        // Validate tensor names against the expected Silero VAD v5 contract.
+                        // If the model file was retrained or replaced with a different export,
+                        // the names below may differ — this check will surface the mismatch
+                        // immediately at load time rather than silently producing wrong results.
+                        const REQUIRED_INPUTS  = ['input', 'state', 'sr'];
+                        const REQUIRED_OUTPUTS = ['output', 'stateN'];
+                        const actualInputs  = Array.from(this._session.inputNames);
+                        const actualOutputs = Array.from(this._session.outputNames);
+
+                        const missingInputs  = REQUIRED_INPUTS.filter(n => !actualInputs.includes(n));
+                        const missingOutputs = REQUIRED_OUTPUTS.filter(n => !actualOutputs.includes(n));
+
+                        console.info('TrueToneSileroVAD: Model loaded.');
+                        console.info('  inputNames :', actualInputs.join(', '));
+                        console.info('  outputNames:', actualOutputs.join(', '));
+
+                        if (missingInputs.length > 0 || missingOutputs.length > 0) {
+                            const msg =
+                                `TrueToneSileroVAD: Tensor name mismatch.\n` +
+                                `  Expected inputs : ${REQUIRED_INPUTS.join(', ')}\n` +
+                                `  Actual inputs   : ${actualInputs.join(', ')}\n` +
+                                `  Expected outputs: ${REQUIRED_OUTPUTS.join(', ')}\n` +
+                                `  Actual outputs  : ${actualOutputs.join(', ')}\n` +
+                                `  Missing inputs  : ${missingInputs.join(', ') || 'none'}\n` +
+                                `  Missing outputs : ${missingOutputs.join(', ') || 'none'}`;
+                            console.error(msg);
+                            throw new Error(msg);
+                        }
 
                         this._modelState = 'ready';
 
@@ -1764,7 +1803,12 @@
                         console.error('TrueToneSileroVAD: Failed to load ONNX model:', err);
                         console.warn('TrueToneSileroVAD: VAD classification will be unavailable. Chunks will pass through unfiltered.');
 
-                        // Flush pending chunks to the queue unfiltered
+                        // Notify the UI that VAD is unavailable
+                        window.dispatchEvent(new CustomEvent('truetone-vad-status', {
+                            detail: { state: 'failed', error: err.message || String(err) }
+                        }));
+
+                        // Flush pending chunks through unfiltered (isSpeech=null)
                         if (this._pendingChunks.length > 0) {
                             const pending = this._pendingChunks;
                             this._pendingChunks = [];
@@ -1781,7 +1825,16 @@
                  */
                 classifyChunk(chunkMeta) {
                     if (this._modelState === 'loading' || this._modelState === 'idle') {
-                        // Model still loading — queue chunk, don't drop it
+                        // Model still loading — queue chunk, don't drop it.
+                        // Cap the pending queue to avoid unbounded memory growth if the model
+                        // takes a very long time to load (network slow, WASM cold start).
+                        if (this._pendingChunks.length >= 50) {
+                            console.warn(
+                                `TrueToneSileroVAD: Pending queue full (50 chunks). ` +
+                                `Dropping oldest chunk while model loads.`
+                            );
+                            this._pendingChunks.shift();
+                        }
                         this._pendingChunks.push(chunkMeta);
                         return;
                     }
@@ -1881,10 +1934,12 @@
                         chunkMeta.vadFrameCount = frameCount;
                         chunkMeta.vadThreshold = this.speechThreshold;
 
-                        // Only queue speech chunks; silence is dropped
-                        if (isSpeech) {
-                            window.TrueToneChunkManager._queue.push(chunkMeta);
-                        }
+                        // Queue ALL chunks — speech AND silence.
+                        // VAD result is preserved as metadata (isSpeech) for the UI and
+                        // for backend acoustic analysis (e.g. pause_ratio_percent).
+                        // Dropping silence here would destroy the temporal timeline that
+                        // the detector and acoustic feature extractor depend on.
+                        window.TrueToneChunkManager._queue.push(chunkMeta);
 
                     } catch (err) {
                         // On error, only pass through if we're still on the same session
@@ -1896,13 +1951,6 @@
                     }
                 },
 
-                /**
-                 * Run Silero VAD inference on a single 512-sample frame.
-                 * Handles the 64-sample rolling context and LSTM state threading.
-                 *
-                 * @param {Float32Array} newSamples — exactly 512 samples
-                 * @returns {Promise<number>} speech probability [0..1]
-                 */
                 /**
                  * Run Silero VAD inference on a single 512-sample frame.
                  * Handles the 64-sample rolling context and LSTM state threading.
@@ -3374,144 +3422,181 @@
             }
 
             // --- Complete Call Analysis & Save Session ---
-            function completeAnalysisSession() {
+            // This function is now async so it can await the backend FINAL_RESULT.
+            async function completeAnalysisSession() {
                 const now = new Date();
                 const formattedDateTime = formatSessionDateTime(now);
 
-                // Calculate duration from dynamic session clock or minimum realistic duration
                 let durationSecs = 0;
                 if (window.TrueToneSessionClock) {
                     durationSecs = window.TrueToneSessionClock.getDurationSeconds();
                     window.TrueToneSessionClock.stop();
                 }
-                if (durationSecs <= 0) durationSecs = 18; // Fallback minimum duration
-                const durationFormatted = formatDuration(durationSecs);
+                if (durationSecs <= 0) durationSecs = 0;
+                const durationFormatted = durationSecs > 0 ? formatDuration(durationSecs) : 'N/A';
 
-                // Use the session ID created at start
-                const sessionId = window.TrueToneAudio.currentSessionId || `TT-Fallback-${Math.floor(1000 + Math.random() * 9000)}`;
+                const sessionId = window.TrueToneAudio.currentSessionId
+                    || `TT-${Date.now()}`;
 
-                // ---- Try to use real pipeline data from TrueToneSocket ----
                 const socket = window.TrueToneSocket;
-                const hasPipelineData = socket && socket._results && socket._results.length > 0;
 
-                let overallResult, isAuthentic, detectionScore, finalAssessment, analysisSummary;
-                let pitch, speechRate, jitter, shimmer, hnr, spectralCentroid, rmsEnergy, pauseRatio;
-                let audioQuality = 'High (Optimal SNR, Low Noise Floor)';
-
-                if (hasPipelineData) {
-                    // === USE REAL PIPELINE DATA ===
-                    const results = socket._results;
-                    const lastResult = results[results.length - 1];
-                    const avgConfidence = results.reduce((s, r) => s + r.confidence, 0) / results.length;
-
-                    isAuthentic = lastResult.verdict === 'HUMAN';
-                    overallResult = isAuthentic ? 'Authentic Human Voice' : 'AI Voice Clone Detected';
-                    detectionScore = isAuthentic
-                        ? `${((1 - avgConfidence) * 100).toFixed(1)}% Authentic`
-                        : `${(avgConfidence * 100).toFixed(1)}% Synthetic Likelihood`;
-
-                    // Per-model breakdown
-                    const models = lastResult.models || {};
-                    const modelNames = Object.keys(models);
-                    const modelScores = modelNames.map(name => {
-                        const m = models[name];
-                        return `${name}: ${m.prediction} (${(m.confidence * 100).toFixed(1)}%, weight: ${m.weight})`;
-                    });
-
-                    const smoothing = lastResult.temporal_smoothing || {};
-                    const trend = smoothing.trend || 'stable';
-                    const movingAvg = smoothing.moving_average_score || avgConfidence;
-
-                    finalAssessment = isAuthentic
-                        ? `Multi-model ensemble analysis across ${results.length} audio windows confirms organic human vocal tract resonance. Temporal smoothing trend: ${trend}. No neural vocoder artifacts detected.`
-                        : `Multi-model ensemble flagged synthetic speech characteristics across ${results.length} windows. Trend: ${trend}. ${(lastResult.explanations || []).join('. ')}.`;
-
-                    analysisSummary = `Analysis of the ${durationFormatted} audio capture processed ${results.length} windows through a 3-model ensemble (${modelNames.join(', ')}). ` +
-                        `Weighted average confidence: ${(movingAvg * 100).toFixed(1)}%. Temporal smoothing trend: ${trend}. ` +
-                        `Model scores: ${modelScores.join('; ')}. ` +
-                        `Explanations: ${(lastResult.explanations || ['No additional notes']).join('. ')}.`;
-
-                    // Acoustic metrics — use real data if available, otherwise use defaults
-                    const metrics = (window.acousticData && window.acousticData.length >= 8) ? window.acousticData : [
-                        { value: 184.2 }, { value: 4.8 }, { value: 0.72 }, { value: 3.4 },
-                        { value: 18.6 }, { value: 2140 }, { value: -18.4 }, { value: 14.2 }
-                    ];
-                    pitch = `${metrics[0].value.toFixed(1)} Hz`;
-                    speechRate = `${metrics[1].value.toFixed(1)} syll/s`;
-                    jitter = `${metrics[2].value.toFixed(2)} %`;
-                    shimmer = `${metrics[3].value.toFixed(2)} %`;
-                    hnr = `${metrics[4].value.toFixed(1)} dB`;
-                    spectralCentroid = `${Math.round(metrics[5].value)} Hz`;
-                    rmsEnergy = `${metrics[6].value.toFixed(1)} dB`;
-                    pauseRatio = `${metrics[7].value.toFixed(1)} %`;
-
-                    console.info(`[TrueTone] Report generated from ${results.length} real pipeline results. Verdict: ${lastResult.verdict}, Avg confidence: ${(avgConfidence * 100).toFixed(1)}%`);
-                } else {
-                    // === FALLBACK: Use legacy local-only assessment ===
-                    console.warn('[TrueTone] No pipeline data available. Using local acoustic fallback.');
-
-                    const metrics = (window.acousticData && window.acousticData.length >= 8) ? window.acousticData : [
-                        { value: 184.2 }, { value: 4.8 }, { value: 0.72 }, { value: 3.4 },
-                        { value: 18.6 }, { value: 2140 }, { value: -18.4 }, { value: 14.2 }
-                    ];
-
-                    pitch = `${metrics[0].value.toFixed(1)} Hz`;
-                    speechRate = `${metrics[1].value.toFixed(1)} syll/s`;
-                    jitter = `${metrics[2].value.toFixed(2)} %`;
-                    shimmer = `${metrics[3].value.toFixed(2)} %`;
-                    hnr = `${metrics[4].value.toFixed(1)} dB`;
-                    spectralCentroid = `${Math.round(metrics[5].value)} Hz`;
-                    rmsEnergy = `${metrics[6].value.toFixed(1)} dB`;
-                    pauseRatio = `${metrics[7].value.toFixed(1)} %`;
-
-                    isAuthentic = metrics[2].value < 1.3 && metrics[4].value > 14.0;
-                    overallResult = isAuthentic ? 'Authentic Human Voice' : 'Potential Voice Clone Anomaly';
-                    detectionScore = isAuthentic 
-                        ? `${(97.8 + Math.random() * 1.8).toFixed(1)}% Authentic`
-                        : `${(84.5 + Math.random() * 5.0).toFixed(1)}% Synthetic Likelihood`;
-
-                    finalAssessment = isAuthentic
-                        ? 'Acoustic variance, natural pitch micro-jitter, and harmonic noise ratio confirm organic human vocal tract resonance without neural vocoder artifacts.'
-                        : 'Phase alignment anomalies and unnaturally uniform harmonics detected across mid-frequency bands, indicating potential neural vocoder synthesis or voice cloning artifact.';
-
-                    analysisSummary = isAuthentic
-                        ? `Analysis of the ${durationFormatted} audio capture revealed continuous biological frequency modulation with the Harmonic-to-Noise Ratio (HNR) sustained at ${hnr}. Micro-jitter measured at ${jitter} with shimmer at ${shimmer}, which firmly correspond with healthy human vocal tract dynamics. Spectral centroid reached ${spectralCentroid} with a pause ratio of ${pauseRatio}, reflecting natural respiratory cadence. Zero phase discontinuities, latent vocoder cutoff, or synthetic speech signatures were identified.`
-                        : `Analysis of the ${durationFormatted} audio stream flagged irregular harmonic preservation with an HNR of ${hnr}. Pitch stability (${pitch}) and jitter (${jitter}) exhibited synthetic rigidity characteristic of neural vocoder auto-regressive generation. Formant contours diverged from normal human physical resonance constraints. Further verification is recommended.`;
+                // ── Step 1: Stop chunk sending and request the authoritative verdict ──
+                // endSession() sends END_SESSION to the backend and waits (up to 5 s) for
+                // the FINAL_RESULT message. The socket stays open until the response arrives.
+                let finalResult = null;
+                if (socket) {
+                    finalResult = await socket.endSession(5000);
+                    socket.disconnect();
                 }
 
-                // Meaningful title per specifications: e.g. Voice Analysis — 13 Sep 2026, 12:42 PM
-                const meaningfulTitle = `Voice Analysis — ${formattedDateTime}`;
+                // ── Step 2: Classify pipeline availability ──────────────────────────
+                // finalResult: the backend's aggregated FINAL_RESULT (authoritative)
+                // streamingResults: per-window results used only for acoustic metrics
+                const streamingResults = socket ? socket._results : [];
+                const hasFinalResult   = finalResult && finalResult.verdict;
+                const hasStreamingData = streamingResults.length > 0;
+
+                // ── Step 3: Build report fields ─────────────────────────────────────
+
+                // verdict is a three-way string. It is NEVER collapsed to a boolean.
+                // HUMAN / AI / UNCERTAIN come from the backend.
+                // PIPELINE_UNAVAILABLE is a frontend-only state when no data was received.
+                let verdict, overallResult, detectionScore, finalAssessment, analysisSummary;
+                let p_fake = null, confidence = null, totalWindows = 0;
+
+                if (hasFinalResult) {
+                    // === AUTHORITATIVE BACKEND RESULT ===
+                    verdict      = finalResult.verdict;         // HUMAN | AI | UNCERTAIN
+                    p_fake       = finalResult.p_fake;          // avg smoothed_p_fake
+                    confidence   = finalResult.confidence;      // per backend definition
+                    totalWindows = finalResult.total_windows || streamingResults.length;
+
+                    // overallResult: human-readable label for the verdict
+                    if (verdict === 'HUMAN') {
+                        overallResult = 'Authentic Human Voice';
+                        // confidence is 1-p_fake for HUMAN (per backend definition)
+                        detectionScore = `${(confidence * 100).toFixed(1)}% Confidence (HUMAN)`;
+                    } else if (verdict === 'AI') {
+                        overallResult = 'AI Voice Clone Detected';
+                        // confidence is p_fake for AI (per backend definition)
+                        detectionScore = `${(confidence * 100).toFixed(1)}% Confidence (AI)`;
+                    } else {
+                        overallResult = 'Result Uncertain';
+                        detectionScore = `${(confidence * 100).toFixed(1)}% Confidence (UNCERTAIN)`;
+                    }
+
+                    const pFakePercent = (p_fake * 100).toFixed(1);
+
+                    // Probabilistic language — no absolute claims about physiology or vocoders.
+                    finalAssessment = verdict === 'HUMAN'
+                        ? `The model classified the ${totalWindows}-window audio session as HUMAN with ${(confidence * 100).toFixed(1)}% confidence. ` +
+                          `Average synthetic probability across all windows: ${pFakePercent}%. ` +
+                          `No features associated with the model's synthetic-speech class were detected at the configured threshold.`
+                        : verdict === 'AI'
+                        ? `The model classified the ${totalWindows}-window audio session as AI with ${(confidence * 100).toFixed(1)}% confidence. ` +
+                          `Average synthetic probability: ${pFakePercent}%. ` +
+                          `The analysed audio exhibited features associated with the synthetic-speech class in the training data.`
+                        : `The model returned an UNCERTAIN result for the ${totalWindows}-window session. ` +
+                          `Average synthetic probability (${pFakePercent}%) falls between the configured thresholds. ` +
+                          `Additional audio or manual review may be required.`;
+
+                    // Two detection branches with a fusion/meta-classifier (not "3-model ensemble")
+                    analysisSummary =
+                        `Audio Voice Detection Analysis Report — ${durationFormatted} session. ` +
+                        `Session ID: ${sessionId}. ` +
+                        `${totalWindows} analysis windows processed through a two-branch detection pipeline ` +
+                        `(spectral-acoustic branch + embedding branch) with a fusion meta-classifier. ` +
+                        `Authoritative verdict: ${verdict}. ` +
+                        `Average synthetic probability (p_fake): ${pFakePercent}%. ` +
+                        `Reported confidence: ${(confidence * 100).toFixed(1)}%.`;
+
+                    console.info(
+                        `[TrueTone] Report: verdict=${verdict}, p_fake=${pFakePercent}%, ` +
+                        `confidence=${(confidence * 100).toFixed(1)}%, windows=${totalWindows}`
+                    );
+
+                } else if (hasStreamingData) {
+                    // === STREAMING DATA ONLY — no authoritative final result ===
+                    // This happens if the backend connection dropped before END_SESSION was
+                    // acknowledged. Show what we have but mark it as incomplete.
+                    verdict       = 'UNCERTAIN';
+                    overallResult = 'Result Incomplete';
+                    detectionScore = 'Final aggregation unavailable';
+
+                    const lastResult = streamingResults[streamingResults.length - 1];
+                    finalAssessment =
+                        `${streamingResults.length} windows were received before the session ended unexpectedly. ` +
+                        `The last window verdict was ${lastResult.verdict} with p_fake=${(lastResult.p_fake * 100).toFixed(1)}%. ` +
+                        `This result has NOT been confirmed by the backend session aggregation. ` +
+                        `Treat this as provisional.`;
+                    analysisSummary = finalAssessment;
+
+                    console.warn('[TrueTone] Report built from streaming data only — FINAL_RESULT was not received.');
+
+                } else {
+                    // === NO PIPELINE DATA ===
+                    // The pipeline produced no results. Do NOT generate fabricated scores.
+                    verdict        = 'PIPELINE_UNAVAILABLE';
+                    overallResult  = 'Analysis Unavailable';
+                    detectionScore = 'No result — pipeline did not produce data';
+                    finalAssessment =
+                        'The analysis session produced no inference results. ' +
+                        'Ensure the backend is running, the microphone is functioning, ' +
+                        'and sufficient audio was captured before completing the session.';
+                    analysisSummary = finalAssessment;
+
+                    console.warn('[TrueTone] No pipeline data received. Report shows PIPELINE_UNAVAILABLE.');
+                }
+
+                // ── Step 4: Acoustic metrics (from live streaming, best-effort) ──────
+                // These are real measurements from the backend's acoustic feature extractor.
+                // If no streaming data was received, fields are left as 'N/A'.
+                let pitch = 'N/A', speechRate = 'N/A', jitter = 'N/A', shimmer = 'N/A';
+                let hnr = 'N/A', spectralCentroid = 'N/A', rmsEnergy = 'N/A', pauseRatio = 'N/A';
+
+                if (window.acousticData && window.acousticData.length >= 8) {
+                    const m = window.acousticData;
+                    pitch           = `${Number(m[0].value).toFixed(1)} Hz`;
+                    speechRate      = `${Number(m[1].value).toFixed(1)} syll/s`;
+                    jitter          = `${Number(m[2].value).toFixed(2)} %`;
+                    shimmer         = `${Number(m[3].value).toFixed(2)} %`;
+                    hnr             = `${Number(m[4].value).toFixed(1)} dB`;
+                    spectralCentroid = `${Math.round(Number(m[5].value))} Hz`;
+                    rmsEnergy       = `${Number(m[6].value).toFixed(1)} dB`;
+                    pauseRatio      = `${Number(m[7].value).toFixed(1)} %`;
+                }
+
+                // ── Step 5: Assemble and store the session object ────────────────────
+                const meaningfulTitle = `Voice Analysis \u2014 ${formattedDateTime}`;
 
                 const session = {
-                    id: sessionId,
-                    sessionId: sessionId,
-                    title: meaningfulTitle,
-                    dateTime: formattedDateTime,
-                    duration: durationFormatted,
-                    overallResult: overallResult,
-                    isAuthentic: isAuthentic,
-                    detectionScore: detectionScore,
-                    pitch: pitch,
-                    speechRate: speechRate,
-                    jitter: jitter,
-                    shimmer: shimmer,
-                    hnr: hnr,
+                    id:               sessionId,
+                    sessionId:        sessionId,
+                    title:            meaningfulTitle,
+                    dateTime:         formattedDateTime,
+                    duration:         durationFormatted,
+                    verdict:          verdict,         // HUMAN | AI | UNCERTAIN | PIPELINE_UNAVAILABLE
+                    overallResult:    overallResult,
+                    detectionScore:   detectionScore,
+                    p_fake:           p_fake,
+                    confidence:       confidence,
+                    totalWindows:     totalWindows,
+                    pitch:            pitch,
+                    speechRate:       speechRate,
+                    jitter:           jitter,
+                    shimmer:          shimmer,
+                    hnr:              hnr,
                     spectralCentroid: spectralCentroid,
-                    rmsEnergy: rmsEnergy,
-                    pauseRatio: pauseRatio,
-                    audioQuality: audioQuality,
-                    finalAssessment: finalAssessment,
-                    analysisSummary: analysisSummary,
-                    createdAt: now.getTime()
+                    rmsEnergy:        rmsEnergy,
+                    pauseRatio:       pauseRatio,
+                    audioQuality:     'Not assessed',  // Not a measured property; remove fake claims
+                    finalAssessment:  finalAssessment,
+                    analysisSummary:  analysisSummary,
+                    createdAt:        now.getTime()
                 };
 
                 // Save to History
                 HistoryStore.save(session);
-
-                // Stop TrueToneSocket WebSocket connection
-                if (window.TrueToneSocket) {
-                    window.TrueToneSocket.disconnect();
-                }
 
                 // Stop microphone tracks if running
                 if (window.TrueToneAudio && window.TrueToneAudio.stream) {
@@ -3567,7 +3652,7 @@
                         <div class="session-item ${isSelected ? 'active border-amber-500/40 bg-amber-500/[0.08]' : 'border-white/[0.04] bg-white/[0.01]'} px-3 py-2.5 rounded-lg border cursor-pointer hover:bg-white/[0.04] hover:border-white/[0.1] transition-all group" data-id="${session.id}">
                             <div class="flex items-center justify-between gap-1 mb-1">
                                 <p class="session-title text-[11px] ${isSelected ? 'text-amber-400 font-semibold' : 'text-[#F5F5F7] font-medium group-hover:text-amber-300/90'} truncate flex-1" title="${session.title}">${session.title}</p>
-                                <span class="w-1.5 h-1.5 rounded-full ${session.isAuthentic !== false ? 'bg-emerald-400' : 'bg-rose-400'} shrink-0"></span>
+                                <span class="w-1.5 h-1.5 rounded-full ${session.verdict === 'HUMAN' ? 'bg-emerald-400' : session.verdict === 'AI' ? 'bg-rose-400' : 'bg-amber-400'} shrink-0"></span>
                             </div>
                             <div class="flex items-center justify-between text-[9px] font-mono text-[#8E8E93]/60">
                                 <span class="text-[#8E8E93]/80">${session.duration}</span>
@@ -3627,10 +3712,13 @@
                 const badgeEl = document.getElementById('report-badge-result');
                 if (badgeEl) {
                     badgeEl.textContent = session.overallResult;
-                    if (session.isAuthentic !== false) {
+                    // Three-way verdict colours: HUMAN=emerald, AI=rose, UNCERTAIN/other=amber
+                    if (session.verdict === 'HUMAN') {
                         badgeEl.className = 'px-2.5 py-0.5 rounded-full text-[10px] font-mono tracking-wider border font-medium border-emerald-500/30 bg-emerald-500/10 text-emerald-400';
-                    } else {
+                    } else if (session.verdict === 'AI') {
                         badgeEl.className = 'px-2.5 py-0.5 rounded-full text-[10px] font-mono tracking-wider border font-medium border-rose-500/30 bg-rose-500/10 text-rose-400';
+                    } else {
+                        badgeEl.className = 'px-2.5 py-0.5 rounded-full text-[10px] font-mono tracking-wider border font-medium border-amber-500/30 bg-amber-500/10 text-amber-400';
                     }
                 }
 
@@ -3647,7 +3735,7 @@
                         { label: 'Session ID', value: session.sessionId, highlight: true },
                         { label: 'Date & Time', value: session.dateTime },
                         { label: 'Duration', value: session.duration },
-                        { label: 'Overall Detection Result', value: session.overallResult, statusBadge: session.isAuthentic !== false ? 'emerald' : 'rose' },
+                        { label: 'Overall Detection Result', value: session.overallResult, statusBadge: session.verdict === 'HUMAN' ? 'emerald' : session.verdict === 'AI' ? 'rose' : 'amber' },
                         { label: 'Detection Score', value: session.detectionScore },
                         { label: 'Pitch (F0)', value: session.pitch },
                         { label: 'Speech Rate', value: session.speechRate },
@@ -3779,10 +3867,12 @@
                 doc.text('OVERALL DETECTION RESULT:', margin + 14, currentY + 22);
 
                 doc.setFontSize(11);
-                if (session.isAuthentic !== false) {
+                if (session.verdict === 'HUMAN') {
                     doc.setTextColor(16, 149, 70); // Emerald
-                } else {
+                } else if (session.verdict === 'AI') {
                     doc.setTextColor(225, 29, 72); // Rose
+                } else {
+                    doc.setTextColor(180, 120, 0); // Amber
                 }
                 doc.text(session.overallResult, margin + 182, currentY + 22);
 
@@ -3869,7 +3959,7 @@
 
                 doc.setFontSize(7.5);
                 doc.setTextColor(156, 163, 175);
-                doc.text('True Tone AI Biometric Intelligence • Genuine Acoustic Verification Certificate', margin, footerY);
+                doc.text('True Tone AI Voice Detection Analysis Report', margin, footerY);
                 doc.text(`Session: ${session.sessionId} • Page 1 of 1`, pageWidth - margin, footerY, { align: 'right' });
 
                 // 6. Save PDF with session ID in filename
@@ -4204,19 +4294,30 @@
         (function () {
             'use strict';
 
-            const BACKEND_WS_BASE = 'ws://localhost:8000';
+            // P2-32: Derive WebSocket and HTTP base URLs from the current origin.
+            // This means wss:// is used automatically on HTTPS, and the app works
+            // on any host without hardcoded localhost references.
+            const BACKEND_WS_BASE   = window.location.protocol === 'https:'
+                ? `wss://${window.location.host}`
+                : `ws://${window.location.hostname}:8000`;
+            const BACKEND_HTTP_BASE = window.location.protocol === 'https:'
+                ? `https://${window.location.host}`
+                : `http://${window.location.hostname}:8000`;
+
+            // Expose so other modules can use the same base URL
+            window.BACKEND_HTTP_BASE = BACKEND_HTTP_BASE;
 
             const TrueToneSocket = {
                 _ws: null,
                 _sessionId: null,
-                _chunkCounter: 0,
-                _results: [],
+                _results: [],        // Incremental streaming window results (for live dashboard)
+                _finalResult: null,  // The single authoritative FINAL_RESULT from the backend
                 _connected: false,
                 _sendInterval: null,
+                _endSessionResolve: null,  // Resolver for the endSession promise
 
                 /**
                  * Connect to the backend WebSocket.
-                 * Creates a unique session ID and opens the connection.
                  */
                 connect(sessionId) {
                     if (this._ws && this._ws.readyState <= WebSocket.OPEN) {
@@ -4224,16 +4325,9 @@
                         return;
                     }
 
-                    // Use supplied session ID or fall back to generating one
-                    if (sessionId) {
-                        this._sessionId = sessionId;
-                    } else {
-                        const ts = Date.now();
-                        const rand = Math.floor(1000 + Math.random() * 9000);
-                        this._sessionId = `session-${ts}-${rand}`;
-                    }
-                    this._chunkCounter = 0;
-                    this._results = [];
+                    this._sessionId   = sessionId || `session-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+                    this._results     = [];
+                    this._finalResult = null;
 
                     const wsUrl = `${BACKEND_WS_BASE}/ws/audio/${this._sessionId}`;
                     console.info(`[TrueToneSocket] Connecting to ${wsUrl}`);
@@ -4254,19 +4348,19 @@
                     this._ws.onmessage = (event) => {
                         try {
                             const data = JSON.parse(event.data);
+
                             if (data.event === 'window_processed' && data.result) {
+                                // Incremental streaming result — update live dashboard
                                 this._results.push(data.result);
                                 console.info(
-                                    `[TrueToneSocket] Result #${this._results.length}: ` +
-                                    `verdict=${data.result.verdict}, confidence=${(data.result.confidence * 100).toFixed(1)}%`
+                                    `[TrueToneSocket] Window #${this._results.length}: ` +
+                                    `verdict=${data.result.verdict}, ` +
+                                    `p_fake=${(data.result.p_fake * 100).toFixed(1)}%, ` +
+                                    `confidence=${(data.result.confidence * 100).toFixed(1)}%`
                                 );
-
-                                // Dispatch event so live dashboard can react
                                 window.dispatchEvent(new CustomEvent('truetone-pipeline-result', {
                                     detail: data.result
                                 }));
-
-                                // Update live acoustic metric cards from backend features
                                 if (data.result.acoustic_features && window.acousticData) {
                                     const af = data.result.acoustic_features;
                                     window.acousticData[0].value = af.pitch_f0_hz;
@@ -4278,6 +4372,30 @@
                                     window.acousticData[6].value = af.rms_energy_db;
                                     window.acousticData[7].value = af.pause_ratio_percent;
                                 }
+
+                            } else if (data.event === 'final_result') {
+                                // Authoritative session result sent after END_SESSION.
+                                // This is what the final report must use — not the last streaming window.
+                                this._finalResult = data;
+                                console.info(
+                                    `[TrueToneSocket] FINAL_RESULT received: ` +
+                                    `verdict=${data.verdict}, ` +
+                                    `p_fake=${(data.p_fake * 100).toFixed(1)}%, ` +
+                                    `confidence=${(data.confidence * 100).toFixed(1)}%, ` +
+                                    `windows=${data.total_windows}`
+                                );
+                                window.dispatchEvent(new CustomEvent('truetone-final-result', {
+                                    detail: data
+                                }));
+                                // Resolve the endSession() promise so disconnect() can proceed
+                                if (this._endSessionResolve) {
+                                    this._endSessionResolve(data);
+                                    this._endSessionResolve = null;
+                                }
+
+                            } else if (data.event === 'inference_error') {
+                                console.warn('[TrueToneSocket] Backend inference error on window:', data);
+
                             } else if (data.error) {
                                 console.warn('[TrueToneSocket] Server error:', data.error, data.details);
                             }
@@ -4293,12 +4411,52 @@
                     this._ws.onclose = (event) => {
                         this._connected = false;
                         this._stopSendingChunks();
+                        // If the socket closed before FINAL_RESULT arrived, resolve with null
+                        if (this._endSessionResolve) {
+                            this._endSessionResolve(null);
+                            this._endSessionResolve = null;
+                        }
                         console.info(`[TrueToneSocket] Disconnected. Code: ${event.code}, Reason: ${event.reason || 'N/A'}`);
                     };
                 },
 
                 /**
-                 * Disconnect the WebSocket and stop sending chunks.
+                 * Signal the backend to finalise the session and wait for FINAL_RESULT.
+                 * Returns a Promise that resolves with the final result object (or null on timeout).
+                 * The frontend should NOT close the socket until this resolves.
+                 */
+                endSession(timeoutMs = 5000) {
+                    return new Promise((resolve) => {
+                        if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+                            resolve(null);
+                            return;
+                        }
+                        // Store the resolver — it will be called by onmessage when FINAL_RESULT arrives
+                        this._endSessionResolve = resolve;
+
+                        // Safety timeout: if backend doesn't respond in time, give up
+                        setTimeout(() => {
+                            if (this._endSessionResolve) {
+                                console.warn('[TrueToneSocket] Timeout waiting for FINAL_RESULT. Proceeding with available data.');
+                                this._endSessionResolve(null);
+                                this._endSessionResolve = null;
+                            }
+                        }, timeoutMs);
+
+                        // Send the END_SESSION control message
+                        try {
+                            this._ws.send(JSON.stringify({ type: 'control', action: 'END_SESSION' }));
+                            console.info('[TrueToneSocket] END_SESSION sent. Waiting for FINAL_RESULT...');
+                        } catch (err) {
+                            console.error('[TrueToneSocket] Failed to send END_SESSION:', err);
+                            resolve(null);
+                        }
+                    });
+                },
+
+                /**
+                 * Stop sending chunks and close the WebSocket.
+                 * Call endSession() BEFORE disconnect() to receive the authoritative verdict.
                  */
                 disconnect() {
                     this._stopSendingChunks();
@@ -4307,12 +4465,18 @@
                         this._ws = null;
                     }
                     this._connected = false;
-                    console.info(`[TrueToneSocket] Session ${this._sessionId} ended. Total results: ${this._results.length}`);
+                    console.info(`[TrueToneSocket] Session ${this._sessionId} closed. Windows received: ${this._results.length}`);
                 },
 
                 /**
-                 * Start polling TrueToneChunkManager and sending chunks over WebSocket.
-                 * Runs every 300ms to batch chunks.
+                 * Poll TrueToneChunkManager every 300 ms and send ALL queued chunks.
+                 *
+                 * P0-2: All chunks (speech AND silence) are sent — VAD result is included
+                 *        as the is_speech field for backend use, but silence is never dropped.
+                 *        Dropping silence would destroy the temporal timeline the detector needs.
+                 *
+                 * P1-9: chunk_id comes from chunk.chunkId (assigned by TrueToneChunkManager).
+                 *        The old _chunkCounter is removed — there is now one authoritative ID source.
                  */
                 _startSendingChunks() {
                     if (this._sendInterval) return;
@@ -4323,19 +4487,14 @@
 
                         const chunks = window.TrueToneChunkManager.drain();
                         for (const chunk of chunks) {
-                            // Only send speech chunks (VAD filtered)
-                            if (chunk.isSpeech === false) continue;
-
-                            this._chunkCounter++;
-
                             const payload = {
                                 session_id: this._sessionId,
-                                chunk_id: this._chunkCounter,
-                                pcm: Array.from(chunk.samples),
+                                chunk_id:   chunk.chunkId,         // authoritative ID from ChunkManager
+                                pcm:        Array.from(chunk.samples),
                                 sample_rate: chunk.sampleRate,
-                                format: 'mono_float32'
+                                format:     'mono_float32',
+                                is_speech:  chunk.isSpeech         // VAD metadata (may be null)
                             };
-
                             try {
                                 this._ws.send(JSON.stringify(payload));
                             } catch (sendErr) {
