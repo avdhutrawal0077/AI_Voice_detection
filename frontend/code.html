@@ -4442,12 +4442,8 @@
             // P2-32: Derive WebSocket and HTTP base URLs from the current origin.
             // This means wss:// is used automatically on HTTPS, and the app works
             // on any host without hardcoded localhost references.
-            const BACKEND_WS_BASE   = window.location.protocol === 'https:'
-                ? `wss://${window.location.host}`
-                : `ws://${window.location.hostname}:8000`;
-            const BACKEND_HTTP_BASE = window.location.protocol === 'https:'
-                ? `https://${window.location.host}`
-                : `http://${window.location.hostname}:8000`;
+            const BACKEND_WS_BASE = 'ws://127.0.0.1:8000';
+            const BACKEND_HTTP_BASE = 'http://127.0.0.1:8000';
 
             // Expose so other modules can use the same base URL
             window.BACKEND_HTTP_BASE = BACKEND_HTTP_BASE;
